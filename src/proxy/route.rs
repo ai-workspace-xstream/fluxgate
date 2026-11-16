@@ -70,25 +70,18 @@ impl CompiledRouter {
         let host_clean = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
 
         // Prefer exact match first, then wildcard match
-        for site in &self.sites {
-            if site
-                .hosts
+        if let Some(site) = self.sites.iter().find(|site| {
+            site.hosts
                 .iter()
                 .any(|h| h.to_ascii_lowercase() == host_clean)
-            {
-                return Some(site);
-            }
+        }) {
+            return Some(site);
         }
-        for site in &self.sites {
-            if site
-                .hosts
+        self.sites.iter().find(|site| {
+            site.hosts
                 .iter()
                 .any(|h| host_matches_wildcard(h, &host_clean))
-            {
-                return Some(site);
-            }
-        }
-        None
+        })
     }
 
     /// Return the primary TLS config if configured on any site.

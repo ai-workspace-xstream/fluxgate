@@ -588,6 +588,7 @@ impl TokenCursor {
         self.tokens.get(self.index).map(|t| &t.kind)
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Token> {
         if self.index < self.tokens.len() {
             let tok = self.tokens[self.index].clone();
