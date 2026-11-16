@@ -1,30 +1,53 @@
 use crate::config::UpstreamTarget;
+use crate::metrics::MetricsRegistry;
 use crate::proxy::route::{uds_path_string, CompiledRouter, RouteResolution};
 use async_trait::async_trait;
 use bytes::Bytes;
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::prelude::*;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct FluxgateProxy {
     pub router: Arc<CompiledRouter>,
     pub https_enabled: bool,
+    pub metrics: Option<Arc<MetricsRegistry>>,
 }
 
-#[derive(Default)]
 pub struct FluxgateCtx {
     pub upstream: Option<UpstreamTarget>,
     pub h2c: bool,
     pub flush_immediately: bool,
     pub host: String,
+    pub route_label: &'static str,
+    pub start_time: Instant,
+    pub active_counted: bool,
+}
+
+impl Default for FluxgateCtx {
+    fn default() -> Self {
+        Self {
+            upstream: None,
+            h2c: false,
+            flush_immediately: false,
+            host: String::new(),
+            route_label: "unknown",
+            start_time: Instant::now(),
+            active_counted: false,
+        }
+    }
 }
 
 impl FluxgateProxy {
-    pub fn new(router: Arc<CompiledRouter>, https_enabled: bool) -> Self {
+    pub fn new(
+        router: Arc<CompiledRouter>,
+        https_enabled: bool,
+        metrics: Option<Arc<MetricsRegistry>>,
+    ) -> Self {
         Self {
             router,
             https_enabled,
+            metrics,
         }
     }
 
@@ -68,13 +91,21 @@ impl ProxyHttp for FluxgateProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> pingora::Result<bool> {
+        ctx.start_time = Instant::now();
+        if let Some(m) = &self.metrics {
+            m.inc_active();
+            ctx.active_counted = true;
+        }
+
         let host = Self::extract_host(session);
+        ctx.host = host.clone();
         let is_tls = session
             .digest()
             .is_some_and(|digest| digest.ssl_digest.is_some());
 
         // Redirect plain HTTP to HTTPS when TLS is enabled (matching Caddy auto_https)
         if self.https_enabled && !is_tls && !host.is_empty() {
+            ctx.route_label = "redirect";
             let host_only = host.split(':').next().unwrap_or(&host);
             let path_and_query = session
                 .req_header()
@@ -93,9 +124,11 @@ impl ProxyHttp for FluxgateProxy {
         let original_uri = session.req_header().uri.clone();
         match self.router.resolve(&host, &original_uri) {
             RouteResolution::Respond { status, body } => {
+                ctx.route_label = "static";
                 Self::send_static_response(session, status, &body).await
             }
             RouteResolution::NotFound => {
+                ctx.route_label = "not_found";
                 Self::send_static_response(session, 404, "Not Found").await
             }
             RouteResolution::Proxy {
@@ -104,13 +137,16 @@ impl ProxyHttp for FluxgateProxy {
                 flush_immediately,
                 new_uri,
             } => {
+                ctx.route_label = match &upstream {
+                    UpstreamTarget::Uds(_) => "uds",
+                    UpstreamTarget::Tcp(_) => "tcp",
+                };
                 if let Some(uri) = new_uri {
                     session.req_header_mut().set_uri(uri);
                 }
                 ctx.upstream = Some(upstream);
                 ctx.h2c = h2c;
                 ctx.flush_immediately = flush_immediately;
-                ctx.host = host;
                 Ok(false)
             }
         }
@@ -186,5 +222,29 @@ impl ProxyHttp for FluxgateProxy {
         // Never perform unsafe automatic retries on streaming requests
         e.set_retry(false);
         e
+    }
+
+    async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX) {
+        if let Some(m) = &self.metrics {
+            if ctx.active_counted {
+                m.dec_active();
+                ctx.active_counted = false;
+            }
+            let status = session
+                .response_written()
+                .map(|resp| resp.status.as_u16())
+                .unwrap_or(if e.is_some() { 502 } else { 0 });
+            let elapsed = ctx.start_time.elapsed().as_secs_f64();
+            m.record_request(&ctx.host, ctx.route_label, status, elapsed);
+            if e.is_some() {
+                if let Some(up) = &ctx.upstream {
+                    let up_label = match up {
+                        UpstreamTarget::Uds(p) => p.to_string_lossy().to_string(),
+                        UpstreamTarget::Tcp(a) => a.clone(),
+                    };
+                    m.record_upstream_error(&up_label);
+                }
+            }
+        }
     }
 }

@@ -12,6 +12,7 @@ pub struct GlobalConfig {
     pub log_level: String,
     pub http_port: u16,
     pub https_port: u16,
+    pub metrics_addr: Option<String>,
 }
 
 impl Default for GlobalConfig {
@@ -21,6 +22,7 @@ impl Default for GlobalConfig {
             log_level: "INFO".to_string(),
             http_port: 80,
             https_port: 443,
+            metrics_addr: None,
         }
     }
 }

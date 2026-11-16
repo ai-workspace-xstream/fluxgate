@@ -1,12 +1,14 @@
 use clap::Parser as ClapParser;
 use fluxgate::cli::{Cli, Commands};
 use fluxgate::config::load_config;
+use fluxgate::metrics::{MetricsRegistry, MetricsService};
 use fluxgate::proxy::{CompiledRouter, FluxgateProxy};
 use fluxgate::tls::build_tls_settings;
 use pingora::listeners::TcpSocketOptions;
 use pingora::prelude::*;
 use pingora::proxy::http_proxy_service_with_name;
 use pingora::server::configuration::ServerConf;
+use pingora::services::background::background_service;
 use std::process;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
@@ -88,7 +90,24 @@ fn main() {
             let mut server = Server::new_with_opt_and_conf(None, server_conf);
             server.bootstrap();
 
-            let proxy = FluxgateProxy::new(router, https_enabled);
+            let metrics_registry = cfg
+                .global
+                .metrics_addr
+                .as_ref()
+                .map(|_| Arc::new(MetricsRegistry::new()));
+
+            if let (Some(addr), Some(reg)) = (&cfg.global.metrics_addr, &metrics_registry) {
+                let svc = background_service(
+                    "Fluxgate Metrics",
+                    MetricsService {
+                        addr: addr.clone(),
+                        registry: reg.clone(),
+                    },
+                );
+                server.add_service(svc);
+            }
+
+            let proxy = FluxgateProxy::new(router, https_enabled, metrics_registry);
             let mut service =
                 http_proxy_service_with_name(&server.configuration, proxy, "Fluxgate HTTP Proxy");
 

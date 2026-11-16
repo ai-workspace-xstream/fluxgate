@@ -182,7 +182,11 @@ impl Parser {
                     }
                 }
                 "metrics" => {
-                    // optional block or single token
+                    let mut addr = "127.0.0.1:9102".to_string();
+                    if let Some(TokenKind::Word(w)) = cursor.peek_kind() {
+                        addr = w.clone();
+                        cursor.next();
+                    }
                     if cursor.peek_kind() == Some(&TokenKind::OpenBrace) {
                         cursor.next();
                         while let Some(k) = cursor.peek_kind() {
@@ -190,9 +194,17 @@ impl Parser {
                                 cursor.next();
                                 break;
                             }
+                            if let TokenKind::Word(sub) = k {
+                                if sub == "listen" {
+                                    cursor.next();
+                                    addr = cursor.expect_word("metrics listen address")?.kind_word();
+                                    continue;
+                                }
+                            }
                             cursor.next();
                         }
                     }
+                    global.metrics_addr = Some(addr);
                 }
                 other => {
                     return Err(FluxgateError::ConfigSyntax {
@@ -484,7 +496,13 @@ impl Parser {
         let upstream_str = cursor
             .expect_word("reverse_proxy upstream address")?
             .kind_word();
-        let upstream = if let Some(rest) = upstream_str.strip_prefix("unix/") {
+        let mut transport = TransportConfig::default();
+        let upstream = if let Some(rest) = upstream_str.strip_prefix("unix+h2c/") {
+            let abs = format!("/{}", rest.trim_start_matches('/'));
+            transport.h2c = true;
+            transport.versions = vec!["h2c".to_string(), "2".to_string()];
+            UpstreamTarget::Uds(PathBuf::from(abs))
+        } else if let Some(rest) = upstream_str.strip_prefix("unix/") {
             let abs = format!("/{}", rest.trim_start_matches('/'));
             UpstreamTarget::Uds(PathBuf::from(abs))
         } else if let Some(rest) = upstream_str.strip_prefix("unix:") {
@@ -494,7 +512,6 @@ impl Parser {
         };
 
         let mut flush_interval = -1;
-        let mut transport = TransportConfig::default();
 
         if cursor.peek_kind() == Some(&TokenKind::OpenBrace) {
             cursor.next(); // consume '{'

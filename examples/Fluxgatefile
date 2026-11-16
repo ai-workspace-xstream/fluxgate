@@ -1,5 +1,6 @@
 {
     grace_period 15s
+    metrics 127.0.0.1:9102
     log {
         level INFO
     }

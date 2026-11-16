@@ -37,6 +37,7 @@ a.svc.plus {
         r#"
 {
     grace_period 15s
+    metrics 127.0.0.1:9102
     log {
         level INFO
     }
@@ -50,6 +51,7 @@ import conf.d/*.conf
     let cfg = load_config(&main_file).unwrap();
     assert_eq!(cfg.global.grace_period_secs, 15);
     assert_eq!(cfg.global.log_level, "INFO");
+    assert_eq!(cfg.global.metrics_addr.as_deref(), Some("127.0.0.1:9102"));
     assert_eq!(cfg.sites.len(), 2);
     // Alphabetical deterministic sort: a.conf before b.conf
     assert_eq!(cfg.sites[0].hosts, vec!["a.svc.plus"]);
@@ -175,5 +177,50 @@ jp-xconnect-01.svc.plus jp-xconnect-02.svc.plus jp-xconnect.svc.plus tky-proxy.s
             }
             other => panic!("Expected UDS h2c proxy for {}, got {:?}", host, other),
         }
+    }
+}
+
+#[test]
+fn test_unix_h2c_shorthand_and_metrics_block() {
+    let dir = tempdir().unwrap();
+    let main_file = dir.path().join("Fluxgatefile");
+    fs::write(
+        &main_file,
+        r#"
+{
+    metrics
+}
+
+jp-xconnect-01.svc.plus {
+    @xhttp {
+        path /split /split/*
+    }
+    handle @xhttp {
+        reverse_proxy unix+h2c//dev/shm/xray.sock
+    }
+    respond "XConnect Edge Agent"
+}
+"#,
+    )
+    .unwrap();
+
+    let cfg = load_config(&main_file).unwrap();
+    assert_eq!(cfg.global.metrics_addr.as_deref(), Some("127.0.0.1:9102"));
+    let router = CompiledRouter::compile(&cfg);
+    match router.resolve("jp-xconnect-01.svc.plus", &"/split".parse().unwrap()) {
+        RouteResolution::Proxy {
+            upstream,
+            h2c,
+            new_uri,
+            ..
+        } => {
+            assert_eq!(
+                upstream,
+                UpstreamTarget::Uds(PathBuf::from("/dev/shm/xray.sock"))
+            );
+            assert!(h2c);
+            assert!(new_uri.is_none());
+        }
+        other => panic!("Expected unix+h2c proxy, got {:?}", other),
     }
 }
