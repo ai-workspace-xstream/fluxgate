@@ -22,6 +22,9 @@ pub enum FluxgateError {
     #[error("Pingora error: {0}")]
     Pingora(String),
 
+    #[error("TLS error: {0}")]
+    TlsError(String),
+
     #[error("Generic error: {0}")]
     Generic(String),
 }

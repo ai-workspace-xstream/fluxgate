@@ -55,12 +55,13 @@ impl Parser {
                 if word == "import" {
                     cursor.next(); // consume 'import'
                     let pattern_token = cursor.expect_word("import pattern")?;
-                    let matched_files = resolve_imports(&canonical, &pattern_token.kind_word())?;
-                    if matched_files.is_empty() && !pattern_token.kind_word().contains('*') {
+                    let pattern = pattern_token.kind_word();
+                    let matched_files = resolve_imports(&canonical, &pattern)?;
+                    if matched_files.is_empty() && !pattern.contains('*') {
                         return Err(FluxgateError::ConfigSyntax {
                             file: pattern_token.file,
                             line: pattern_token.line,
-                            msg: format!("Imported file '{}' not found", pattern_token.kind_word()),
+                            msg: format!("Imported file '{}' not found", pattern),
                         });
                     }
                     for imported in matched_files {
@@ -97,14 +98,14 @@ impl Parser {
             }
 
             if hosts.is_empty() {
-                let tok = cursor.current().unwrap_or(&Token {
-                    kind: TokenKind::Newline,
-                    line: 1,
-                    file: path.to_path_buf(),
-                });
+                let (err_file, err_line) = if let Some(tok) = cursor.current() {
+                    (tok.file.clone(), tok.line)
+                } else {
+                    (path.to_path_buf(), 1)
+                };
                 return Err(FluxgateError::ConfigSyntax {
-                    file: tok.file.clone(),
-                    line: tok.line,
+                    file: err_file,
+                    line: err_line,
                     msg: "Expected site address before '{'".to_string(),
                 });
             }
@@ -478,7 +479,7 @@ impl Parser {
     fn parse_reverse_proxy(
         &self,
         cursor: &mut TokenCursor,
-        tok: Token,
+        _tok: Token,
     ) -> Result<ReverseProxyConfig> {
         let upstream_str = cursor
             .expect_word("reverse_proxy upstream address")?
