@@ -134,7 +134,10 @@ impl MetricsRegistry {
             out,
             "# HELP fluxgate_http_request_duration_seconds HTTP request duration in seconds."
         );
-        let _ = writeln!(out, "# TYPE fluxgate_http_request_duration_seconds histogram");
+        let _ = writeln!(
+            out,
+            "# TYPE fluxgate_http_request_duration_seconds histogram"
+        );
         if let Ok(lat) = self.latency_by_route.lock() {
             for ((host, route), series) in lat.iter() {
                 let h = escape_label(host);
@@ -279,8 +282,6 @@ mod tests {
         assert!(text.contains(
             "fluxgate_http_requests_total{host=\"jp-xconnect-01.svc.plus\",route=\"xhttp\",status=\"200\"} 1"
         ));
-        assert!(text.contains(
-            "fluxgate_upstream_errors_total{upstream=\"/dev/shm/xray.sock\"} 1"
-        ));
+        assert!(text.contains("fluxgate_upstream_errors_total{upstream=\"/dev/shm/xray.sock\"} 1"));
     }
 }

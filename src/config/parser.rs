@@ -197,7 +197,8 @@ impl Parser {
                             if let TokenKind::Word(sub) = k {
                                 if sub == "listen" {
                                     cursor.next();
-                                    addr = cursor.expect_word("metrics listen address")?.kind_word();
+                                    addr =
+                                        cursor.expect_word("metrics listen address")?.kind_word();
                                     continue;
                                 }
                             }
