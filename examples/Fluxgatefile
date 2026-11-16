@@ -1,0 +1,8 @@
+{
+    grace_period 15s
+    log {
+        level INFO
+    }
+}
+
+import conf.d/*.conf

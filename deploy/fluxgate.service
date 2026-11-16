@@ -1,0 +1,19 @@
+[Unit]
+Description=Fluxgate Lightweight HTTP/HTTPS Reverse Proxy (Pingora)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/fluxgate validate --config /etc/fluxgate/Fluxgatefile
+ExecStart=/usr/local/bin/fluxgate run --config /etc/fluxgate/Fluxgatefile
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+TimeoutStopSec=20s
+
+[Install]
+WantedBy=multi-user.target
