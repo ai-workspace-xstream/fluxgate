@@ -224,25 +224,67 @@ impl ProxyHttp for FluxgateProxy {
         e
     }
 
+    fn error_while_proxy(
+        &self,
+        peer: &HttpPeer,
+        _session: &mut Session,
+        e: Box<Error>,
+        _ctx: &mut Self::CTX,
+        _client_reused: bool,
+    ) -> Box<Error> {
+        let mut e = e.more_context(format!("Peer: {}", peer));
+        // Never retry streaming / UDS requests
+        e.set_retry(false);
+        e
+    }
+
+    fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, error: &Error) -> bool {
+        let err_text = error.to_string();
+        // Downstream client cancellation is normal lifecycle for streaming protocols (e.g. XHTTP)
+        if error.esource() == &ErrorSource::Downstream
+            || err_text.contains("Client closed H2")
+            || err_text.contains("stream no longer needed")
+            || err_text.contains("Broken pipe")
+            || err_text.contains("Connection reset by peer")
+        {
+            return true;
+        }
+        false
+    }
+
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX) {
         if let Some(m) = &self.metrics {
             if ctx.active_counted {
                 m.dec_active();
                 ctx.active_counted = false;
             }
+            let is_downstream_cancel = e.is_some_and(|err| {
+                err.esource() == &ErrorSource::Downstream
+                    || err.to_string().contains("stream no longer needed")
+                    || err.to_string().contains("Client closed H2")
+            });
             let status = session
                 .response_written()
                 .map(|resp| resp.status.as_u16())
-                .unwrap_or(if e.is_some() { 502 } else { 0 });
+                .unwrap_or(if is_downstream_cancel {
+                    499
+                } else if e.is_some() {
+                    502
+                } else {
+                    0
+                });
             let elapsed = ctx.start_time.elapsed().as_secs_f64();
             m.record_request(&ctx.host, ctx.route_label, status, elapsed);
-            if e.is_some() {
-                if let Some(up) = &ctx.upstream {
-                    let up_label = match up {
-                        UpstreamTarget::Uds(p) => p.to_string_lossy().to_string(),
-                        UpstreamTarget::Tcp(a) => a.clone(),
-                    };
-                    m.record_upstream_error(&up_label);
+            if let Some(err) = e {
+                // Only increment upstream error counter if it is genuinely an upstream failure
+                if !is_downstream_cancel && err.esource() == &ErrorSource::Upstream {
+                    if let Some(up) = &ctx.upstream {
+                        let up_label = match up {
+                            UpstreamTarget::Uds(p) => p.to_string_lossy().to_string(),
+                            UpstreamTarget::Tcp(a) => a.clone(),
+                        };
+                        m.record_upstream_error(&up_label);
+                    }
                 }
             }
         }
