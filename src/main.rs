@@ -75,7 +75,8 @@ fn main() {
             let primary_tls = router.primary_tls().cloned();
             let https_enabled = primary_tls.is_some();
 
-            let mut server_conf = ServerConf::new().expect("Failed to initialize Pingora ServerConf");
+            let mut server_conf =
+                ServerConf::new().expect("Failed to initialize Pingora ServerConf");
             server_conf.threads = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(2);

@@ -2,7 +2,7 @@ use crate::config::ast::*;
 use crate::proxy::rewrite::{rebuild_uri, remove_query_param, strip_path_prefix};
 use http::Uri;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct CompiledRouter {
@@ -71,12 +71,20 @@ impl CompiledRouter {
 
         // Prefer exact match first, then wildcard match
         for site in &self.sites {
-            if site.hosts.iter().any(|h| h.to_ascii_lowercase() == host_clean) {
+            if site
+                .hosts
+                .iter()
+                .any(|h| h.to_ascii_lowercase() == host_clean)
+            {
                 return Some(site);
             }
         }
         for site in &self.sites {
-            if site.hosts.iter().any(|h| host_matches_wildcard(h, &host_clean)) {
+            if site
+                .hosts
+                .iter()
+                .any(|h| host_matches_wildcard(h, &host_clean))
+            {
                 return Some(site);
             }
         }
@@ -137,10 +145,9 @@ impl CompiledSite {
                     let matcher_paths = matcher
                         .as_ref()
                         .and_then(|name| matchers.get(name).cloned());
-                    if let Some(block) = compile_block(
-                        RouteBlockKind::Handle { matcher_paths },
-                        directives,
-                    ) {
+                    if let Some(block) =
+                        compile_block(RouteBlockKind::Handle { matcher_paths }, directives)
+                    {
                         routes.push(block);
                     }
                 }
@@ -191,7 +198,9 @@ impl CompiledSite {
         // Step 2: Match first matching `handle_path` / `handle` block (Caddy mutually-exclusive semantics)
         for route in &self.routes {
             let matched = match &route.kind {
-                RouteBlockKind::HandlePath { prefix } => path_matches_pattern(&current_path, prefix),
+                RouteBlockKind::HandlePath { prefix } => {
+                    path_matches_pattern(&current_path, prefix)
+                }
                 RouteBlockKind::Handle { matcher_paths } => match matcher_paths {
                     Some(paths) => paths_match(&current_path, paths),
                     None => true,
@@ -312,7 +321,7 @@ fn path_matches_pattern(req_path: &str, pattern: &str) -> bool {
     }
 }
 
-pub fn uds_path_string(path: &PathBuf) -> String {
+pub fn uds_path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
@@ -321,6 +330,7 @@ mod tests {
     use super::*;
     use crate::config::parser::Parser;
     use std::io::Write;
+    use std::path::PathBuf;
     use tempfile::NamedTempFile;
 
     #[test]

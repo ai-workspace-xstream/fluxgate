@@ -122,7 +122,10 @@ impl ProxyHttp for FluxgateProxy {
         ctx: &mut Self::CTX,
     ) -> pingora::Result<Box<HttpPeer>> {
         let upstream = ctx.upstream.as_ref().ok_or_else(|| {
-            Error::explain(ErrorType::InternalError, "Missing upstream target in context")
+            Error::explain(
+                ErrorType::InternalError,
+                "Missing upstream target in context",
+            )
         })?;
 
         let mut peer = match upstream {
@@ -164,10 +167,7 @@ impl ProxyHttp for FluxgateProxy {
                 upstream_request.insert_header("X-Forwarded-For", inet.ip().to_string())?;
             }
         }
-        let proto = if session
-            .digest()
-            .is_some_and(|d| d.ssl_digest.is_some())
-        {
+        let proto = if session.digest().is_some_and(|d| d.ssl_digest.is_some()) {
             "https"
         } else {
             "http"

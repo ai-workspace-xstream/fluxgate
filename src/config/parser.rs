@@ -5,15 +5,14 @@ use crate::error::{FluxgateError, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Default)]
 pub struct Parser {
     import_tracker: ImportTracker,
 }
 
 impl Parser {
     pub fn new() -> Self {
-        Self {
-            import_tracker: ImportTracker::new(),
-        }
+        Self::default()
     }
 
     pub fn parse_file(&mut self, path: &Path) -> Result<FluxgateConfig> {
@@ -119,7 +118,11 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_global_block(&self, cursor: &mut TokenCursor, global: &mut GlobalConfig) -> Result<()> {
+    fn parse_global_block(
+        &self,
+        cursor: &mut TokenCursor,
+        global: &mut GlobalConfig,
+    ) -> Result<()> {
         while let Some(kind) = cursor.peek_kind() {
             if *kind == TokenKind::CloseBrace {
                 cursor.next();
@@ -136,20 +139,21 @@ impl Parser {
                 "grace_period" => {
                     let val_tok = cursor.expect_word("grace_period value (e.g. 15s)")?;
                     let val_str = val_tok.kind_word();
-                    let secs = val_str
-                        .trim_end_matches('s')
-                        .parse::<u64>()
-                        .map_err(|_| FluxgateError::ConfigSyntax {
+                    let secs = val_str.trim_end_matches('s').parse::<u64>().map_err(|_| {
+                        FluxgateError::ConfigSyntax {
                             file: val_tok.file,
                             line: val_tok.line,
                             msg: format!("Invalid grace_period duration '{}'", val_str),
-                        })?;
+                        }
+                    })?;
                     global.grace_period_secs = secs;
                 }
                 "log" => {
                     // skip/parse log block: log [name] { level INFO }
                     if cursor.peek_kind() == Some(&TokenKind::OpenBrace)
-                        || (cursor.peek_kind().map_or(false, |k| matches!(k, TokenKind::Word(_))))
+                        || cursor
+                            .peek_kind()
+                            .is_some_and(|k| matches!(k, TokenKind::Word(_)))
                     {
                         if let Some(TokenKind::Word(_)) = cursor.peek_kind() {
                             cursor.next();
@@ -292,9 +296,13 @@ impl Parser {
                     directives.push(Directive::Rewrite { matcher, target });
                 }
                 "uri" => {
-                    let sub = cursor.expect_word("uri sub-directive (e.g. query)")?.kind_word();
+                    let sub = cursor
+                        .expect_word("uri sub-directive (e.g. query)")?
+                        .kind_word();
                     if sub == "query" {
-                        let op = cursor.expect_word("uri query operation (e.g. -param)")?.kind_word();
+                        let op = cursor
+                            .expect_word("uri query operation (e.g. -param)")?
+                            .kind_word();
                         if let Some(param) = op.strip_prefix('-') {
                             directives.push(Directive::UriQueryRemove {
                                 param: param.to_string(),
@@ -303,7 +311,10 @@ impl Parser {
                             return Err(FluxgateError::ConfigSyntax {
                                 file: tok.file,
                                 line: tok.line,
-                                msg: format!("Unsupported uri query operation '{}', expected -param", op),
+                                msg: format!(
+                                    "Unsupported uri query operation '{}', expected -param",
+                                    op
+                                ),
                             });
                         }
                     } else {
@@ -469,7 +480,9 @@ impl Parser {
         cursor: &mut TokenCursor,
         tok: Token,
     ) -> Result<ReverseProxyConfig> {
-        let upstream_str = cursor.expect_word("reverse_proxy upstream address")?.kind_word();
+        let upstream_str = cursor
+            .expect_word("reverse_proxy upstream address")?
+            .kind_word();
         let upstream = if let Some(rest) = upstream_str.strip_prefix("unix/") {
             let abs = format!("/{}", rest.trim_start_matches('/'));
             UpstreamTarget::Uds(PathBuf::from(abs))
@@ -502,7 +515,9 @@ impl Parser {
                         flush_interval = val.parse::<i32>().unwrap_or(-1);
                     }
                     "transport" => {
-                        let proto = cursor.expect_word("transport protocol (e.g. http)")?.kind_word();
+                        let proto = cursor
+                            .expect_word("transport protocol (e.g. http)")?
+                            .kind_word();
                         if proto == "http" {
                             cursor.expect(TokenKind::OpenBrace, "open brace '{' for transport")?;
                             while let Some(tk) = cursor.peek_kind() {
@@ -517,7 +532,8 @@ impl Parser {
                                 let t_tok = cursor.next().unwrap();
                                 if t_tok.kind_word() == "versions" {
                                     while let Some(vk) = cursor.peek_kind() {
-                                        if *vk == TokenKind::Newline || *vk == TokenKind::CloseBrace {
+                                        if *vk == TokenKind::Newline || *vk == TokenKind::CloseBrace
+                                        {
                                             break;
                                         }
                                         if let TokenKind::Word(ver) = vk {
