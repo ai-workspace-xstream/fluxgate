@@ -241,15 +241,11 @@ impl ProxyHttp for FluxgateProxy {
     fn suppress_error_log(&self, _session: &Session, _ctx: &Self::CTX, error: &Error) -> bool {
         let err_text = error.to_string();
         // Downstream client cancellation is normal lifecycle for streaming protocols (e.g. XHTTP)
-        if error.esource() == &ErrorSource::Downstream
+        error.esource() == &ErrorSource::Downstream
             || err_text.contains("Client closed H2")
             || err_text.contains("stream no longer needed")
             || err_text.contains("Broken pipe")
             || err_text.contains("Connection reset by peer")
-        {
-            return true;
-        }
-        false
     }
 
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Self::CTX) {
