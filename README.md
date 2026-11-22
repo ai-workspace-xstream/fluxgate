@@ -58,6 +58,10 @@
 - **原生 `h2c` over Unix Domain Socket**：显式保持 HTTP/2 cleartext prior-knowledge 转发给本地 UDS（如 `/dev/shm/xray.sock`），杜绝隐式降级至 HTTP/1.1。
 - **纯净日志 • 源码级 499 降噪**：拦截下游客户端主动发起的 `RST_STREAM` / `stream no longer needed` 取消事件，智能映射为 HTTP 499，彻底平息伪报警刷屏。
 - **流式零缓冲流水线**：流式透传双向 Body 数据流，默认配置 1MB HTTP/2 流控大窗口，禁用不安全的自动重试机制。
+- **v0.2.0 生产控制面增强**（详见 [v0.2.0 路线规划](docs/roadmap-v0.2.0.md) 与 [CHANGELOG](CHANGELOG.md)）：
+  - **Vault KV v2 安全同步**：内存级 `SecretStore`（`zeroize` 清零 + 脱敏日志），支持 AppRole / Token / systemd `LoadCredential` 及 `{vault.<alias>.<key>}` 动态注入。
+  - **GitOps 零中断热重载**：配合 Ansible Pull 拉取非敏感声明、`import` 消费、`fluxgate reload`（`ArcSwap` 原子切换）与 `--strict-gitops` 敏感信息门禁。
+  - **纯 Rust ACME DNS-01 自动续期**：原生支持 `cloudflare` 与 `alidns`，基于 Pingora `TlsAccept` 动态 SNI 热替换，并支持 **Vault KV CAS 多节点证书共享**。
 
 ---
 
@@ -69,8 +73,17 @@
 # 校验配置文件语法（支持友好报错与行号定位）
 fluxgate validate --config /etc/fluxgate/Fluxgatefile
 
+# 严格 GitOps 离线门禁校验（拒绝明文私钥/Token）
+fluxgate validate --strict-gitops --offline --config /etc/fluxgate/Fluxgatefile
+
 # 启动反向代理服务
 fluxgate run --config /etc/fluxgate/Fluxgatefile
+
+# 无损热重载配置（向运行中进程发送 SIGHUP）
+fluxgate reload
+
+# 诊断配置、Vault 连通性与证书有效期
+fluxgate doctor --config /etc/fluxgate/Fluxgatefile
 
 # 查看版本
 fluxgate version

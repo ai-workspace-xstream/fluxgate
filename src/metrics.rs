@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -20,12 +20,25 @@ struct RouteSeries {
     buckets: [u64; 12],
 }
 
+#[derive(Default, Clone, Copy)]
+struct VaultMetricState {
+    success: bool,
+    last_sync_unix: i64,
+    version: u64,
+}
+
 pub struct MetricsRegistry {
     start_time: Instant,
     active_connections: AtomicI64,
     requests_by_status: Mutex<HashMap<(String, String, u16), u64>>,
     latency_by_route: Mutex<HashMap<(String, String), RouteSeries>>,
     upstream_errors: Mutex<HashMap<String, u64>>,
+    vault_sync: Mutex<HashMap<String, VaultMetricState>>,
+    config_reload_success: AtomicI64,
+    config_last_reload_unix: AtomicI64,
+    config_hash: Mutex<String>,
+    tls_cert_expiry: Mutex<HashMap<String, i64>>,
+    acme_renews: Mutex<HashMap<(String, String, String), u64>>,
 }
 
 impl Default for MetricsRegistry {
@@ -36,12 +49,22 @@ impl Default for MetricsRegistry {
 
 impl MetricsRegistry {
     pub fn new() -> Self {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         Self {
             start_time: Instant::now(),
             active_connections: AtomicI64::new(0),
             requests_by_status: Mutex::new(HashMap::new()),
             latency_by_route: Mutex::new(HashMap::new()),
             upstream_errors: Mutex::new(HashMap::new()),
+            vault_sync: Mutex::new(HashMap::new()),
+            config_reload_success: AtomicI64::new(1),
+            config_last_reload_unix: AtomicI64::new(now_unix),
+            config_hash: Mutex::new(String::new()),
+            tls_cert_expiry: Mutex::new(HashMap::new()),
+            acme_renews: Mutex::new(HashMap::new()),
         }
     }
 
@@ -77,6 +100,52 @@ impl MetricsRegistry {
     pub fn record_upstream_error(&self, upstream: &str) {
         if let Ok(mut map) = self.upstream_errors.lock() {
             *map.entry(upstream.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    pub fn record_vault_sync(
+        &self,
+        alias: &str,
+        success: bool,
+        version: u64,
+        timestamp_secs: i64,
+    ) {
+        if let Ok(mut map) = self.vault_sync.lock() {
+            let entry = map.entry(alias.to_string()).or_default();
+            entry.success = success;
+            if success {
+                entry.last_sync_unix = timestamp_secs;
+                entry.version = version;
+            }
+        }
+    }
+
+    pub fn record_config_reload(&self, success: bool, config_hash: &str, timestamp_secs: i64) {
+        self.config_reload_success
+            .store(if success { 1 } else { 0 }, Ordering::Relaxed);
+        if success {
+            self.config_last_reload_unix
+                .store(timestamp_secs, Ordering::Relaxed);
+            if let Ok(mut h) = self.config_hash.lock() {
+                *h = config_hash.to_string();
+            }
+        }
+    }
+
+    pub fn record_tls_cert_expiry(&self, domains: &str, not_after_unix: i64) {
+        if let Ok(mut map) = self.tls_cert_expiry.lock() {
+            map.insert(domains.to_string(), not_after_unix);
+        }
+    }
+
+    pub fn record_acme_renew(&self, domains: &str, provider: &str, result: &str) {
+        if let Ok(mut map) = self.acme_renews.lock() {
+            *map.entry((
+                domains.to_string(),
+                provider.to_string(),
+                result.to_string(),
+            ))
+            .or_insert(0) += 1;
         }
     }
 
@@ -178,6 +247,138 @@ impl MetricsRegistry {
                     out,
                     "fluxgate_upstream_errors_total{{upstream=\"{}\"}} {}",
                     escape_label(upstream),
+                    count
+                );
+            }
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP fluxgate_vault_sync_success Whether the last Vault KV sync succeeded (1=ok, 0=err)."
+        );
+        let _ = writeln!(out, "# TYPE fluxgate_vault_sync_success gauge");
+        let _ = writeln!(
+            out,
+            "# HELP fluxgate_vault_last_sync_timestamp_seconds Unix timestamp of last successful Vault KV sync."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE fluxgate_vault_last_sync_timestamp_seconds gauge"
+        );
+        let _ = writeln!(
+            out,
+            "# HELP fluxgate_vault_sync_version Current KV v2 metadata version cached for Vault alias."
+        );
+        let _ = writeln!(out, "# TYPE fluxgate_vault_sync_version gauge");
+        if let Ok(vaults) = self.vault_sync.lock() {
+            for (alias, st) in vaults.iter() {
+                let a = escape_label(alias);
+                let _ = writeln!(
+                    out,
+                    "fluxgate_vault_sync_success{{alias=\"{}\"}} {}",
+                    a,
+                    if st.success { 1 } else { 0 }
+                );
+                let _ = writeln!(
+                    out,
+                    "fluxgate_vault_last_sync_timestamp_seconds{{alias=\"{}\"}} {}",
+                    a, st.last_sync_unix
+                );
+                let _ = writeln!(
+                    out,
+                    "fluxgate_vault_sync_version{{alias=\"{}\"}} {}",
+                    a, st.version
+                );
+            }
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP fluxgate_config_reload_success Whether the last configuration reload succeeded."
+        );
+        let _ = writeln!(out, "# TYPE fluxgate_config_reload_success gauge");
+        let _ = writeln!(
+            out,
+            "fluxgate_config_reload_success {}",
+            self.config_reload_success.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP fluxgate_config_last_reload_timestamp_seconds Unix timestamp of last successful config reload."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE fluxgate_config_last_reload_timestamp_seconds gauge"
+        );
+        let _ = writeln!(
+            out,
+            "fluxgate_config_last_reload_timestamp_seconds {}",
+            self.config_last_reload_unix.load(Ordering::Relaxed)
+        );
+
+        if let Ok(hash) = self.config_hash.lock() {
+            if !hash.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "# HELP fluxgate_config_info Active configuration SHA-256 fingerprint."
+                );
+                let _ = writeln!(out, "# TYPE fluxgate_config_info gauge");
+                let _ = writeln!(
+                    out,
+                    "fluxgate_config_info{{sha256=\"{}\"}} 1",
+                    escape_label(&hash)
+                );
+            }
+        }
+
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "# HELP fluxgate_tls_cert_expiry_timestamp_seconds Certificate NotAfter Unix timestamp."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE fluxgate_tls_cert_expiry_timestamp_seconds gauge"
+        );
+        let _ = writeln!(
+            out,
+            "# HELP fluxgate_tls_cert_days_remaining Remaining certificate validity in days."
+        );
+        let _ = writeln!(out, "# TYPE fluxgate_tls_cert_days_remaining gauge");
+        if let Ok(certs) = self.tls_cert_expiry.lock() {
+            for (domains, not_after) in certs.iter() {
+                let d = escape_label(domains);
+                let days = (*not_after - now_unix) as f64 / 86400.0;
+                let _ = writeln!(
+                    out,
+                    "fluxgate_tls_cert_expiry_timestamp_seconds{{domains=\"{}\"}} {}",
+                    d, not_after
+                );
+                let _ = writeln!(
+                    out,
+                    "fluxgate_tls_cert_days_remaining{{domains=\"{}\"}} {:.2}",
+                    d, days
+                );
+            }
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP fluxgate_acme_renew_total Total ACME renewal attempts by result."
+        );
+        let _ = writeln!(out, "# TYPE fluxgate_acme_renew_total counter");
+        if let Ok(renews) = self.acme_renews.lock() {
+            for ((domains, provider, result), count) in renews.iter() {
+                let _ = writeln!(
+                    out,
+                    "fluxgate_acme_renew_total{{domains=\"{}\",provider=\"{}\",result=\"{}\"}} {}",
+                    escape_label(domains),
+                    escape_label(provider),
+                    escape_label(result),
                     count
                 );
             }

@@ -47,7 +47,7 @@ jobs:
 
       - name: Clippy lint
         if: matrix.target_name == 'linux-amd64'
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Run unit & integration tests
         run: cargo test --verbose
@@ -65,10 +65,43 @@ jobs:
           path: target/release/fluxgate
           retention-days: 14
 
+  release:
+    name: Publish Multi-Arch GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download linux-amd64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fluxgate-linux-amd64
+          path: dist/amd64
+
+      - name: Download linux-arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fluxgate-linux-arm64
+          path: dist/arm64
+
+      - name: Prepare release assets and SHA256SUMS
+        run: |
+          mkdir -p release-assets
+          cp dist/amd64/fluxgate release-assets/fluxgate-linux-amd64
+          cp dist/arm64/fluxgate release-assets/fluxgate-linux-arm64
+          cp dist/amd64/fluxgate release-assets/fluxgate
+          chmod +x release-assets/fluxgate*
+          (cd release-assets && sha256sum fluxgate fluxgate-linux-amd64 fluxgate-linux-arm64 > SHA256SUMS && cat SHA256SUMS)
+
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v') && matrix.target_name == 'linux-amd64'
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/fluxgate
+          files: |
+            release-assets/fluxgate
+            release-assets/fluxgate-linux-amd64
+            release-assets/fluxgate-linux-arm64
+            release-assets/SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

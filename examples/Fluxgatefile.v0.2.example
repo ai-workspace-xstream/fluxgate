@@ -1,0 +1,30 @@
+{
+    grace_period 15s
+    metrics 127.0.0.1:9102
+    log {
+        level INFO
+    }
+
+    vault {
+        addr env(VAULT_ADDR)
+        auth approle
+        sync dns kv/data/prod/fluxgate/dns-tokens 5m
+    }
+}
+
+# Consume non-sensitive node route declarations synced via Ansible Pull
+import /var/lib/ansible-pull/gitops/nodes/ph-xconnect/*.conf
+
+# Or inline non-sensitive site block with ACME DNS-01 + Vault KV multi-node sharing:
+# *.svc.plus ph-xconnect.svc.plus ph-xconnect-gateway-01.svc.plus {
+#     tls {
+#         issuer acme {
+#             email ops@svc.plus
+#             ca letsencrypt
+#         }
+#         dns cloudflare {vault.dns.cf_api_token}
+#         renew_before 30d
+#         storage vault kv/data/prod/fluxgate/certs
+#     }
+#     respond "Fluxgate v0.2.0 Ready" 200
+# }

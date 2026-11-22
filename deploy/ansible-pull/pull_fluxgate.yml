@@ -1,0 +1,97 @@
+---
+# Ansible Pull self-convergence playbook for Fluxgate v0.2.0
+# Usage:
+#   sudo ansible-pull -U https://github.com/ai-workspace-infra/playbooks.git \
+#     -d /var/lib/ansible-pull/playbooks-fluxgate -i localhost, pull_fluxgate.yml
+- name: Converge Fluxgate v0.2.0 reverse proxy from GitOps declarations
+  hosts: localhost
+  connection: local
+  become: true
+  vars:
+    fluxgate_repo: "ai-workspace-xstream/fluxgate"
+    fluxgate_version: "v0.2.0"
+    fluxgate_binary_path: "/usr/local/bin/fluxgate"
+    fluxgate_config_dir: "/etc/fluxgate"
+    fluxgate_config_file: "/etc/fluxgate/Fluxgatefile"
+    fluxgate_gitops_dir: "{{ lookup('ansible.builtin.env', 'GITOPS_CHECKOUT_DIR') | default('/var/lib/ansible-pull/gitops', true) }}"
+    fluxgate_env_file: "/etc/ansible-pull/gitops-declaration.env"
+    fluxgate_arch: "{{ 'amd64' if ansible_architecture in ['x86_64', 'amd64'] else ('arm64' if ansible_architecture in ['aarch64', 'arm64'] else ansible_architecture) }}"
+    fluxgate_asset_name: "fluxgate-linux-{{ fluxgate_arch }}"
+  tasks:
+    - name: Ensure Fluxgate configuration and state directories exist
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ fluxgate_config_dir }}", mode: "0755" }
+        - { path: "{{ fluxgate_config_dir }}/conf.d", mode: "0755" }
+        - { path: "/var/lib/fluxgate/certs", mode: "0700" }
+
+    - name: Check currently installed Fluxgate version
+      ansible.builtin.command: "{{ fluxgate_binary_path }} version"
+      register: fluxgate_current_version
+      changed_when: false
+      failed_when: false
+
+    - name: Download SHA256SUMS and Fluxgate binary when version differs
+      when: fluxgate_current_version.rc != 0 or (fluxgate_version | regex_replace('^v', '')) not in fluxgate_current_version.stdout
+      block:
+        - name: Create temporary download directory
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: fluxgate-upgrade-
+          register: fluxgate_tmp
+
+        - name: Download SHA256SUMS from GitHub Release
+          ansible.builtin.get_url:
+            url: "https://github.com/{{ fluxgate_repo }}/releases/download/{{ fluxgate_version }}/SHA256SUMS"
+            dest: "{{ fluxgate_tmp.path }}/SHA256SUMS"
+            mode: "0644"
+
+        - name: Download architecture-matched Fluxgate release binary
+          ansible.builtin.get_url:
+            url: "https://github.com/{{ fluxgate_repo }}/releases/download/{{ fluxgate_version }}/{{ fluxgate_asset_name }}"
+            dest: "{{ fluxgate_tmp.path }}/{{ fluxgate_asset_name }}"
+            mode: "0755"
+
+        - name: Verify downloaded binary against SHA256SUMS
+          ansible.builtin.command:
+            cmd: "sha256sum -c SHA256SUMS --ignore-missing"
+            chdir: "{{ fluxgate_tmp.path }}"
+          changed_when: false
+
+        - name: Install verified Fluxgate binary atomically
+          ansible.builtin.copy:
+            src: "{{ fluxgate_tmp.path }}/{{ fluxgate_asset_name }}"
+            dest: "{{ fluxgate_binary_path }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0755"
+          register: fluxgate_binary_updated
+
+        - name: Remove temporary download directory
+          ansible.builtin.file:
+            path: "{{ fluxgate_tmp.path }}"
+            state: absent
+
+    - name: Verify non-sensitive GitOps configuration compliance
+      ansible.builtin.command: "{{ fluxgate_binary_path }} validate --strict-gitops --offline --config {{ fluxgate_config_file }}"
+      changed_when: false
+
+    - name: Restart Fluxgate service if binary was upgraded
+      ansible.builtin.systemd:
+        name: fluxgate
+        state: restarted
+        enabled: true
+        daemon_reload: true
+      when: fluxgate_binary_updated is defined and fluxgate_binary_updated.changed
+
+    - name: Hot-reload Fluxgate configuration without dropping active connections
+      ansible.builtin.systemd:
+        name: fluxgate
+        state: reloaded
+      when: fluxgate_binary_updated is not defined or not fluxgate_binary_updated.changed

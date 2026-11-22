@@ -5,8 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+EnvironmentFile=-/etc/fluxgate/fluxgate.env
+StateDirectory=fluxgate
+StateDirectoryMode=0700
 ExecStartPre=/usr/local/bin/fluxgate validate --config /etc/fluxgate/Fluxgatefile
 ExecStart=/usr/local/bin/fluxgate run --config /etc/fluxgate/Fluxgatefile
+ExecReload=/usr/local/bin/fluxgate reload --pid-file /tmp/fluxgate.pid
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=1048576
