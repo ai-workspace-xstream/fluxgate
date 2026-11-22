@@ -176,20 +176,23 @@ async fn handle_http_connection(
         }
     };
 
-    let header_text = String::from_utf8_lossy(&buf[..header_end]);
-    let mut lines = header_text.split("\r\n");
-    let request_line = lines.next().unwrap_or("");
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let raw_target = parts.next().unwrap_or("/");
-    let path = raw_target.split('?').next().unwrap_or("/");
+    let (method, path, headers) = {
+        let header_text = String::from_utf8_lossy(&buf[..header_end]);
+        let mut lines = header_text.split("\r\n");
+        let request_line = lines.next().unwrap_or("");
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("").to_string();
+        let raw_target = parts.next().unwrap_or("/");
+        let path = raw_target.split('?').next().unwrap_or("/").to_string();
 
-    let mut headers = HashMap::new();
-    for line in lines {
-        if let Some((name, val)) = line.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), val.trim().to_string());
+        let mut headers = HashMap::new();
+        for line in lines {
+            if let Some((name, val)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), val.trim().to_string());
+            }
         }
-    }
+        (method, path, headers)
+    };
 
     let content_length: usize = headers
         .get("content-length")
@@ -206,7 +209,7 @@ async fn handle_http_connection(
     let body_bytes = &buf[body_start..body_end];
 
     let (status_line, resp_json) =
-        dispatch_request(method, path, &headers, body_bytes, &state).await;
+        dispatch_request(&method, &path, &headers, body_bytes, &state).await;
     let resp_body = serde_json::to_string(&resp_json).unwrap();
     let raw_resp = format!(
         "HTTP/1.1 {}\r\n\

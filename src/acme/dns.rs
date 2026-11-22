@@ -487,7 +487,7 @@ impl AliDnsProvider {
         for item in domains {
             if let Some(name) = item.get("DomainName").and_then(|v| v.as_str()) {
                 if split_rr_and_domain(fqdn, name).is_some() {
-                    let replace = best.as_ref().map_or(true, |prev| name.len() > prev.len());
+                    let replace = best.as_ref().is_none_or(|prev| name.len() > prev.len());
                     if replace {
                         best = Some(name.to_string());
                     }

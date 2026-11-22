@@ -552,7 +552,10 @@ a.svc.plus {
 
     // build_tls_settings rejects ACME config and directs caller to dynamic TLS
     let acme_cfg = load_config(&gitops_ok_file).unwrap();
-    let tls_err = build_tls_settings(acme_cfg.sites[0].tls.as_ref().unwrap()).unwrap_err();
+    let tls_err = match build_tls_settings(acme_cfg.sites[0].tls.as_ref().unwrap()) {
+        Ok(_) => panic!("Expected ACME TLS config to fail build_tls_settings"),
+        Err(e) => e,
+    };
     assert!(tls_err.to_string().contains("build_dynamic_tls_settings"));
 }
 
