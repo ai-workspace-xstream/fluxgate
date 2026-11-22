@@ -2,21 +2,191 @@ use crate::config::ast::*;
 use crate::error::{FluxgateError, Result};
 use std::collections::HashSet;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ValidateOptions {
+    pub offline: bool,
+    pub strict_gitops: bool,
+}
+
 pub fn validate_config(config: &FluxgateConfig) -> Result<()> {
+    validate_config_with_options(config, ValidateOptions::default())
+}
+
+pub fn validate_config_with_options(config: &FluxgateConfig, opts: ValidateOptions) -> Result<()> {
+    let _ = opts.offline;
+
     if config.sites.is_empty() {
         return Err(FluxgateError::ConfigValidation(
             "Configuration contains no site definitions".to_string(),
         ));
     }
 
+    let mut vault_aliases = HashSet::new();
+    if let Some(vault) = &config.global.vault {
+        validate_vault(vault, &mut vault_aliases, opts.strict_gitops)?;
+    }
+
     for site in &config.sites {
-        validate_site(site)?;
+        validate_site(site, &vault_aliases, opts.strict_gitops)?;
     }
 
     Ok(())
 }
 
-fn validate_site(site: &SiteConfig) -> Result<()> {
+fn validate_vault<'a>(
+    vault: &'a VaultConfig,
+    vault_aliases: &mut HashSet<&'a str>,
+    strict_gitops: bool,
+) -> Result<()> {
+    validate_vault_endpoint_ref("global.vault.addr", &vault.addr, strict_gitops)?;
+    if let Some(ns) = &vault.namespace {
+        validate_vault_endpoint_ref("global.vault.namespace", ns, strict_gitops)?;
+    }
+    if let Some(ca_cert) = &vault.ca_cert {
+        if ca_cert.as_os_str().is_empty() {
+            return Err(FluxgateError::ConfigValidation(
+                "global.vault.ca_cert path cannot be empty".to_string(),
+            ));
+        }
+        let ca_str = ca_cert.to_string_lossy();
+        if strict_gitops && looks_like_inline_pem(&ca_str) {
+            return Err(FluxgateError::ConfigValidation(
+                "--strict-gitops rejected inline PEM material in global.vault.ca_cert".to_string(),
+            ));
+        }
+        if !ca_cert.exists() {
+            tracing::warn!(
+                "Vault CA cert file does not exist at validate time: {}",
+                ca_cert.display()
+            );
+        }
+    }
+
+    for sync in &vault.syncs {
+        if sync.alias.trim().is_empty()
+            || sync.alias.contains('.')
+            || sync.alias.chars().any(char::is_whitespace)
+        {
+            return Err(FluxgateError::ConfigValidation(format!(
+                "Invalid vault sync alias '{}'",
+                sync.alias
+            )));
+        }
+        if !vault_aliases.insert(sync.alias.as_str()) {
+            return Err(FluxgateError::ConfigValidation(format!(
+                "Duplicate vault sync alias '{}'",
+                sync.alias
+            )));
+        }
+        if sync.interval_secs < 1 {
+            return Err(FluxgateError::ConfigValidation(format!(
+                "Vault sync '{}' interval must be at least 1 second",
+                sync.alias
+            )));
+        }
+        if !is_valid_kv_v2_path(&sync.kv_path) {
+            return Err(FluxgateError::ConfigValidation(format!(
+                "Vault sync '{}' kv_path '{}' must match kv/data/<path>",
+                sync.alias, sync.kv_path
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_vault_endpoint_ref(
+    field_name: &str,
+    sref: &SecretRef,
+    strict_gitops: bool,
+) -> Result<()> {
+    match sref {
+        SecretRef::Env(var) => {
+            if var.trim().is_empty() {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "Empty environment variable name in {}",
+                    field_name
+                )));
+            }
+        }
+        SecretRef::Literal(val) => {
+            if val.trim().is_empty() {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "Empty value in {}",
+                    field_name
+                )));
+            }
+            if strict_gitops && looks_like_plaintext_secret(val) {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "--strict-gitops rejected suspected secret literal in {}",
+                    field_name
+                )));
+            }
+        }
+        SecretRef::Vault { .. } => {
+            return Err(FluxgateError::ConfigValidation(format!(
+                "{} cannot reference a Vault secret (must be a URL literal or env(...))",
+                field_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_secret_ref(
+    field_name: &str,
+    sref: &SecretRef,
+    is_sensitive: bool,
+    vault_aliases: &HashSet<&str>,
+    strict_gitops: bool,
+) -> Result<()> {
+    match sref {
+        SecretRef::Env(var) => {
+            if var.trim().is_empty() {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "Empty environment variable name in {}",
+                    field_name
+                )));
+            }
+        }
+        SecretRef::Vault { alias, key } => {
+            if alias.trim().is_empty() || key.trim().is_empty() {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "Invalid Vault secret reference in {}: alias and key must be non-empty",
+                    field_name
+                )));
+            }
+            if !vault_aliases.contains(alias.as_str()) {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "Unknown Vault sync alias '{}' referenced in {}",
+                    alias, field_name
+                )));
+            }
+        }
+        SecretRef::Literal(val) => {
+            if val.trim().is_empty() {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "Empty literal value in {}",
+                    field_name
+                )));
+            }
+            if strict_gitops && (is_sensitive || looks_like_plaintext_secret(val)) {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "--strict-gitops rejected plaintext credential literal in {}; \
+                     use {{vault.<alias>.<key>}} or env(...)",
+                    field_name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_site(
+    site: &SiteConfig,
+    vault_aliases: &HashSet<&str>,
+    strict_gitops: bool,
+) -> Result<()> {
     if site.hosts.is_empty() {
         return Err(FluxgateError::ConfigValidation(
             "Site definition has empty host list".to_string(),
@@ -26,31 +196,130 @@ fn validate_site(site: &SiteConfig) -> Result<()> {
     // Collect available named matchers
     let matcher_names: HashSet<&str> = site.matchers.iter().map(|m| m.name.as_str()).collect();
 
-    // Validate TLS paths if present
+    // Validate TLS config if present
     if let Some(tls) = &site.tls {
-        if !tls.cert_path.exists() {
-            tracing::warn!(
-                "TLS cert file does not exist at validate time: {}",
-                tls.cert_path.display()
-            );
-        }
-        if !tls.key_path.exists() {
-            tracing::warn!(
-                "TLS key file does not exist at validate time: {}",
-                tls.key_path.display()
-            );
-        }
+        validate_tls(tls, vault_aliases, strict_gitops)?;
     }
 
     // Validate directives
     for directive in &site.directives {
-        validate_directive(directive, &matcher_names)?;
+        validate_directive(directive, &matcher_names, strict_gitops)?;
     }
 
     Ok(())
 }
 
-fn validate_directive(directive: &Directive, matchers: &HashSet<&str>) -> Result<()> {
+fn validate_tls(tls: &TlsConfig, vault_aliases: &HashSet<&str>, strict_gitops: bool) -> Result<()> {
+    match tls {
+        TlsConfig::Static {
+            cert_path,
+            key_path,
+        } => {
+            if cert_path.as_os_str().is_empty() || key_path.as_os_str().is_empty() {
+                return Err(FluxgateError::ConfigValidation(
+                    "Static TLS cert_path and key_path cannot be empty".to_string(),
+                ));
+            }
+            if strict_gitops
+                && (looks_like_inline_pem(&cert_path.to_string_lossy())
+                    || looks_like_inline_pem(&key_path.to_string_lossy()))
+            {
+                return Err(FluxgateError::ConfigValidation(
+                    "--strict-gitops rejected inline PEM material in static tls directive"
+                        .to_string(),
+                ));
+            }
+            if !cert_path.exists() {
+                tracing::warn!(
+                    "TLS cert file does not exist at validate time: {}",
+                    cert_path.display()
+                );
+            }
+            if !key_path.exists() {
+                tracing::warn!(
+                    "TLS key file does not exist at validate time: {}",
+                    key_path.display()
+                );
+            }
+        }
+        TlsConfig::Acme(acme) => {
+            let valid_email = acme
+                .email
+                .trim()
+                .split_once('@')
+                .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty());
+            if !valid_email {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "ACME TLS email '{}' must be non-empty and contain '@'",
+                    acme.email
+                )));
+            }
+            if acme.ca_url.trim().is_empty()
+                || (!acme.ca_url.starts_with("https://") && !acme.ca_url.starts_with("http://"))
+            {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "ACME TLS ca_url '{}' must be a valid http(s) URL",
+                    acme.ca_url
+                )));
+            }
+            if acme.renew_before_days < 1 {
+                return Err(FluxgateError::ConfigValidation(
+                    "ACME TLS renew_before must be at least 1 day".to_string(),
+                ));
+            }
+            if acme.storage_dir.as_os_str().is_empty() {
+                return Err(FluxgateError::ConfigValidation(
+                    "ACME TLS storage_dir cannot be empty".to_string(),
+                ));
+            }
+            if let Some(vault_path) = &acme.vault_storage_path {
+                if !is_valid_kv_v2_path(vault_path) {
+                    return Err(FluxgateError::ConfigValidation(format!(
+                        "ACME TLS storage vault path '{}' must match kv/data/<path>",
+                        vault_path
+                    )));
+                }
+            }
+            match &acme.dns_provider {
+                DnsProviderConfig::Cloudflare { api_token } => {
+                    validate_secret_ref(
+                        "tls.dns.cloudflare.api_token",
+                        api_token,
+                        true,
+                        vault_aliases,
+                        strict_gitops,
+                    )?;
+                }
+                DnsProviderConfig::AliDns {
+                    access_key_id,
+                    access_key_secret,
+                } => {
+                    validate_secret_ref(
+                        "tls.dns.alidns.access_key_id",
+                        access_key_id,
+                        true,
+                        vault_aliases,
+                        strict_gitops,
+                    )?;
+                    validate_secret_ref(
+                        "tls.dns.alidns.access_key_secret",
+                        access_key_secret,
+                        true,
+                        vault_aliases,
+                        strict_gitops,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_directive(
+    directive: &Directive,
+    matchers: &HashSet<&str>,
+    strict_gitops: bool,
+) -> Result<()> {
     match directive {
         Directive::HandlePath { prefix, directives } => {
             if !prefix.starts_with('/') {
@@ -60,7 +329,7 @@ fn validate_directive(directive: &Directive, matchers: &HashSet<&str>) -> Result
                 )));
             }
             for inner in directives {
-                validate_directive(inner, matchers)?;
+                validate_directive(inner, matchers, strict_gitops)?;
             }
         }
         Directive::Handle {
@@ -76,7 +345,7 @@ fn validate_directive(directive: &Directive, matchers: &HashSet<&str>) -> Result
                 }
             }
             for inner in directives {
-                validate_directive(inner, matchers)?;
+                validate_directive(inner, matchers, strict_gitops)?;
             }
         }
         Directive::Rewrite { matcher, target } => {
@@ -118,7 +387,48 @@ fn validate_directive(directive: &Directive, matchers: &HashSet<&str>) -> Result
                 }
             }
         },
-        Directive::Respond(_) => {}
+        Directive::Respond(resp) => {
+            if strict_gitops && has_secret_markers(&resp.body) {
+                return Err(FluxgateError::ConfigValidation(
+                    "--strict-gitops rejected suspected secret material in respond directive"
+                        .to_string(),
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+fn is_valid_kv_v2_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("kv/data/") else {
+        return false;
+    };
+    if rest.is_empty() || rest.starts_with('/') || rest.ends_with('/') || rest.contains("//") {
+        return false;
+    }
+    if rest.split('/').any(|seg| seg == "." || seg == "..") {
+        return false;
+    }
+    rest.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+}
+
+fn looks_like_inline_pem(val: &str) -> bool {
+    val.contains("-----BEGIN ")
+        || val.contains("PRIVATE KEY")
+        || val.contains('\n')
+        || val.contains('\r')
+}
+
+fn has_secret_markers(val: &str) -> bool {
+    let trimmed = val.trim();
+    val.contains("-----BEGIN ")
+        || val.contains("PRIVATE KEY")
+        || trimmed.starts_with("hvs.")
+        || trimmed.starts_with("hvb.")
+        || trimmed.starts_with("s.")
+}
+
+fn looks_like_plaintext_secret(val: &str) -> bool {
+    looks_like_inline_pem(val) || has_secret_markers(val)
 }

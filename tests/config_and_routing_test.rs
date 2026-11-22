@@ -1,8 +1,17 @@
-use fluxgate::config::{load_config, UpstreamTarget};
+use arc_swap::ArcSwap;
+use fluxgate::config::{
+    compute_config_hash, load_config, load_config_with_options, parse_secret_ref,
+    DnsProviderConfig, SecretRef, TlsConfig, UpstreamTarget, ValidateOptions, VaultAuthMode,
+    LETSENCRYPT_PROD_DIRECTORY, LETSENCRYPT_STAGING_DIRECTORY,
+};
 use fluxgate::proxy::route::RouteResolution;
 use fluxgate::proxy::CompiledRouter;
+use fluxgate::tls::{build_tls_settings, DynamicCertStore};
+use pingora::tls::x509::X509;
+use rcgen::{generate_simple_self_signed, CertifiedKey};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tempfile::tempdir;
 
 #[test]
@@ -223,4 +232,462 @@ jp-xconnect-01.svc.plus {
         }
         other => panic!("Expected unix+h2c proxy, got {:?}", other),
     }
+}
+
+#[test]
+fn test_vault_block_and_placeholder_parsing() {
+    let dir = tempdir().unwrap();
+    let main_file = dir.path().join("Fluxgatefile");
+    fs::write(
+        &main_file,
+        r#"
+{
+    vault {
+        addr env(VAULT_ADDR)
+        namespace {env.VAULT_NAMESPACE}
+        auth approle
+        ca_cert /etc/fluxgate/vault-ca.pem
+        sync dns kv/data/prod/fluxgate/dns 5m
+        sync certs kv/data/prod/fluxgate/certs 1h
+    }
+}
+
+*.svc.plus {
+    tls {
+        issuer acme {
+            email ops@svc.plus
+            ca letsencrypt-staging
+        }
+        dns cloudflare {vault.dns.cf_api_token}
+        renew_before 30d
+        storage vault kv/data/prod/fluxgate/certs
+    }
+    respond "ok"
+}
+"#,
+    )
+    .unwrap();
+
+    let cfg = load_config(&main_file).unwrap();
+    let vault = cfg.global.vault.as_ref().expect("expected vault config");
+    assert_eq!(vault.addr, SecretRef::Env("VAULT_ADDR".to_string()));
+    assert_eq!(
+        vault.namespace,
+        Some(SecretRef::Env("VAULT_NAMESPACE".to_string()))
+    );
+    assert_eq!(vault.auth, VaultAuthMode::AppRole);
+    assert_eq!(
+        vault.ca_cert.as_deref(),
+        Some(Path::new("/etc/fluxgate/vault-ca.pem"))
+    );
+    assert_eq!(vault.syncs.len(), 2);
+    assert_eq!(vault.syncs[0].alias, "dns");
+    assert_eq!(vault.syncs[0].kv_path, "kv/data/prod/fluxgate/dns");
+    assert_eq!(vault.syncs[0].interval_secs, 300);
+    assert_eq!(vault.syncs[1].alias, "certs");
+    assert_eq!(vault.syncs[1].interval_secs, 3600);
+
+    match cfg.sites[0].tls.as_ref().unwrap() {
+        TlsConfig::Acme(acme) => {
+            assert_eq!(acme.email, "ops@svc.plus");
+            assert_eq!(acme.ca_url, LETSENCRYPT_STAGING_DIRECTORY);
+            assert_eq!(acme.renew_before_days, 30);
+            assert_eq!(
+                acme.vault_storage_path.as_deref(),
+                Some("kv/data/prod/fluxgate/certs")
+            );
+            assert_eq!(
+                acme.dns_provider,
+                DnsProviderConfig::Cloudflare {
+                    api_token: SecretRef::Vault {
+                        alias: "dns".to_string(),
+                        key: "cf_api_token".to_string(),
+                    },
+                }
+            );
+        }
+        other => panic!("Expected TlsConfig::Acme, got {:?}", other),
+    }
+
+    assert_eq!(
+        parse_secret_ref("{vault.dns.nested.key}"),
+        SecretRef::Vault {
+            alias: "dns".to_string(),
+            key: "nested.key".to_string(),
+        }
+    );
+    let redacted = format!("{:?}", SecretRef::Literal("super_secret_token".to_string()));
+    assert!(!redacted.contains("super_secret_token"));
+    assert!(redacted.contains("REDACTED"));
+}
+
+#[test]
+fn test_acme_tls_alidns_and_config_hash() {
+    let dir = tempdir().unwrap();
+    let main_file = dir.path().join("Fluxgatefile");
+    fs::write(
+        &main_file,
+        r#"
+{
+    vault {
+        addr https://vault.svc.plus
+        auth token
+        sync dns kv/data/prod/fluxgate/alidns 30s
+    }
+}
+
+cn.svc.plus {
+    tls {
+        issuer acme {
+            email admin@svc.plus
+            ca letsencrypt
+        }
+        dns alidns {vault.dns.ak} {vault.dns.sk}
+        renew_before 48h
+        storage_dir /tmp/fluxgate-acme-test
+    }
+    respond "cn-edge"
+}
+"#,
+    )
+    .unwrap();
+
+    let cfg = load_config_with_options(
+        &main_file,
+        ValidateOptions {
+            offline: true,
+            strict_gitops: true,
+        },
+    )
+    .unwrap();
+
+    let vault = cfg.global.vault.as_ref().unwrap();
+    assert_eq!(vault.auth, VaultAuthMode::Token);
+    assert_eq!(vault.syncs[0].interval_secs, 30);
+
+    match cfg.sites[0].tls.as_ref().unwrap() {
+        TlsConfig::Acme(acme) => {
+            assert_eq!(acme.ca_url, LETSENCRYPT_PROD_DIRECTORY);
+            assert_eq!(acme.renew_before_days, 2);
+            assert_eq!(acme.storage_dir, PathBuf::from("/tmp/fluxgate-acme-test"));
+            assert_eq!(
+                acme.dns_provider,
+                DnsProviderConfig::AliDns {
+                    access_key_id: SecretRef::Vault {
+                        alias: "dns".to_string(),
+                        key: "ak".to_string(),
+                    },
+                    access_key_secret: SecretRef::Vault {
+                        alias: "dns".to_string(),
+                        key: "sk".to_string(),
+                    },
+                }
+            );
+        }
+        other => panic!("Expected TlsConfig::Acme, got {:?}", other),
+    }
+
+    let hash_a = compute_config_hash(&cfg);
+    let hash_b = compute_config_hash(&cfg);
+    assert_eq!(hash_a.len(), 64);
+    assert_eq!(hash_a, hash_b);
+}
+
+#[test]
+fn test_validation_errors_and_strict_gitops() {
+    let dir = tempdir().unwrap();
+
+    // 1. Unknown Vault alias
+    let unknown_alias_file = dir.path().join("unknown_alias.conf");
+    fs::write(
+        &unknown_alias_file,
+        r#"
+{
+    vault {
+        addr env(VAULT_ADDR)
+        sync dns kv/data/prod/fluxgate/dns 5m
+    }
+}
+
+a.svc.plus {
+    tls {
+        issuer acme {
+            email ops@svc.plus
+        }
+        dns cloudflare {vault.missing.cf_api_token}
+    }
+    respond "ok"
+}
+"#,
+    )
+    .unwrap();
+    let err = load_config(&unknown_alias_file).unwrap_err();
+    assert!(err.to_string().contains("missing"), "got: {}", err);
+
+    // 2. Invalid kv/data/... path
+    let bad_kv_file = dir.path().join("bad_kv.conf");
+    fs::write(
+        &bad_kv_file,
+        r#"
+{
+    vault {
+        sync dns kv/prod/not_v2 5m
+    }
+}
+
+a.svc.plus {
+    respond "ok"
+}
+"#,
+    )
+    .unwrap();
+    let err = load_config(&bad_kv_file).unwrap_err();
+    assert!(err.to_string().contains("kv/data/"), "got: {}", err);
+
+    // 3. --strict-gitops rejects plaintext token in dns cloudflare
+    let raw_token_file = dir.path().join("raw_token.conf");
+    fs::write(
+        &raw_token_file,
+        r#"
+a.svc.plus {
+    tls {
+        issuer acme {
+            email ops@svc.plus
+            ca letsencrypt-staging
+        }
+        dns cloudflare raw_token_123
+    }
+    respond "ok"
+}
+"#,
+    )
+    .unwrap();
+    assert!(load_config(&raw_token_file).is_ok());
+    let err = load_config_with_options(
+        &raw_token_file,
+        ValidateOptions {
+            offline: true,
+            strict_gitops: true,
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("strict-gitops"), "got: {}", err);
+
+    // 4. --strict-gitops allows {vault.dns.cf_api_token}
+    let gitops_ok_file = dir.path().join("gitops_ok.conf");
+    fs::write(
+        &gitops_ok_file,
+        r#"
+{
+    vault {
+        addr https://vault.svc.plus
+        sync dns kv/data/prod/fluxgate/dns 5m
+    }
+}
+
+a.svc.plus {
+    tls {
+        issuer acme {
+            email ops@svc.plus
+            ca letsencrypt-staging
+        }
+        dns cloudflare {vault.dns.cf_api_token}
+    }
+    respond "ok"
+}
+"#,
+    )
+    .unwrap();
+    assert!(load_config_with_options(
+        &gitops_ok_file,
+        ValidateOptions {
+            offline: true,
+            strict_gitops: true,
+        },
+    )
+    .is_ok());
+
+    // 5. Unrecognized sub-directives in vault {} and tls {} return ConfigSyntax errors
+    let bad_vault_dir = dir.path().join("bad_vault_dir.conf");
+    fs::write(
+        &bad_vault_dir,
+        r#"
+{
+    vault {
+        unknown_vault_option foo
+    }
+}
+a.svc.plus {
+    respond "ok"
+}
+"#,
+    )
+    .unwrap();
+    let err = load_config(&bad_vault_dir).unwrap_err();
+    assert!(
+        err.to_string().contains("unknown_vault_option"),
+        "got: {}",
+        err
+    );
+
+    let bad_tls_dir = dir.path().join("bad_tls_dir.conf");
+    fs::write(
+        &bad_tls_dir,
+        r#"
+a.svc.plus {
+    tls {
+        unknown_tls_option bar
+    }
+    respond "ok"
+}
+"#,
+    )
+    .unwrap();
+    let err = load_config(&bad_tls_dir).unwrap_err();
+    assert!(
+        err.to_string().contains("unknown_tls_option"),
+        "got: {}",
+        err
+    );
+
+    // build_tls_settings rejects ACME config and directs caller to dynamic TLS
+    let acme_cfg = load_config(&gitops_ok_file).unwrap();
+    let tls_err = match build_tls_settings(acme_cfg.sites[0].tls.as_ref().unwrap()) {
+        Ok(_) => panic!("Expected ACME TLS config to fail build_tls_settings"),
+        Err(e) => e,
+    };
+    assert!(tls_err.to_string().contains("build_dynamic_tls_settings"));
+}
+
+#[test]
+fn test_arc_swap_router_hot_reload() {
+    let dir = tempdir().unwrap();
+    let conf = dir.path().join("Fluxgatefile");
+
+    fs::write(
+        &conf,
+        r#"
+a.svc.plus {
+    respond "v1"
+}
+"#,
+    )
+    .unwrap();
+    let cfg_v1 = load_config(&conf).unwrap();
+    let router = Arc::new(ArcSwap::from_pointee(CompiledRouter::compile(&cfg_v1)));
+
+    let old_guard = router.load();
+    match old_guard.resolve("a.svc.plus", &"/".parse().unwrap()) {
+        RouteResolution::Respond { body, .. } => assert_eq!(body, "v1"),
+        other => panic!("Expected v1, got {:?}", other),
+    }
+
+    fs::write(
+        &conf,
+        r#"
+a.svc.plus {
+    respond "v2"
+}
+"#,
+    )
+    .unwrap();
+    let cfg_v2 = load_config(&conf).unwrap();
+    router.store(Arc::new(CompiledRouter::compile(&cfg_v2)));
+
+    match router.load().resolve("a.svc.plus", &"/".parse().unwrap()) {
+        RouteResolution::Respond { body, .. } => assert_eq!(body, "v2"),
+        other => panic!("Expected v2, got {:?}", other),
+    }
+    // Existing guard from before swap continues seeing v1 safely
+    match old_guard.resolve("a.svc.plus", &"/".parse().unwrap()) {
+        RouteResolution::Respond { body, .. } => assert_eq!(body, "v1"),
+        other => panic!("Expected v1 on old guard, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_dynamic_cert_store_sni_and_hot_replacement() {
+    let store = DynamicCertStore::new();
+    let domains = vec![
+        "*.svc.plus".to_string(),
+        "jp-xconnect-02.svc.plus".to_string(),
+    ];
+
+    let CertifiedKey {
+        cert: cert1,
+        key_pair: key1,
+    } = generate_simple_self_signed(domains.clone()).unwrap();
+    let cert1_pem = cert1.pem();
+    let key1_pem = key1.serialize_pem();
+
+    store
+        .upsert_pem(&domains, &cert1_pem, &key1_pem, 0)
+        .unwrap();
+
+    assert_eq!(store.domain_count(), 2);
+    assert!(store.has_domain("jp-xconnect-02.svc.plus"));
+    assert!(store.has_domain("ph-xconnect-gateway-01.svc.plus"));
+    assert!(!store.has_domain("a.b.svc.plus"));
+    assert!(!store.has_domain("other.example.com"));
+    assert!(!store.has_domain(""));
+
+    assert!(store.lookup_sni("jp-xconnect-02.svc.plus").is_some());
+    assert!(store.lookup_sni("JP-XCONNECT-02.SVC.PLUS").is_some());
+    assert!(store.lookup_sni("*.svc.plus").is_some());
+    assert!(store
+        .lookup_sni("ph-xconnect-gateway-01.svc.plus")
+        .is_some());
+    assert!(store.lookup_sni("a.b.svc.plus").is_none());
+    assert!(store.lookup_sni("other.example.com").is_none());
+    assert!(store.lookup_sni("").is_some());
+
+    let (before_leaf, _, _) = store.lookup_sni("ph-xconnect-gateway-01.svc.plus").unwrap();
+    let before_der = before_leaf.to_der().unwrap();
+
+    // Hot replace with newly issued certificate
+    let CertifiedKey {
+        cert: cert2,
+        key_pair: key2,
+    } = generate_simple_self_signed(domains.clone()).unwrap();
+    let cert2_pem = cert2.pem();
+    let key2_pem = key2.serialize_pem();
+    let expected_der = X509::from_pem(cert2_pem.as_bytes())
+        .unwrap()
+        .to_der()
+        .unwrap();
+
+    store
+        .upsert_pem(&domains, &cert2_pem, &key2_pem, 1_950_000_000)
+        .unwrap();
+
+    let (after_leaf, _, _) = store.lookup_sni("ph-xconnect-gateway-01.svc.plus").unwrap();
+    let after_der = after_leaf.to_der().unwrap();
+    assert_ne!(before_der, after_der);
+    assert_eq!(after_der, expected_der);
+    assert_eq!(
+        store.get_expiry("ph-xconnect-gateway-01.svc.plus"),
+        Some(1_950_000_000)
+    );
+
+    // Reloading static certs preserves ACME certs
+    let dir = tempdir().unwrap();
+    let static_cert_path = dir.path().join("static.crt");
+    let static_key_path = dir.path().join("static.key");
+    let CertifiedKey {
+        cert: static_cert,
+        key_pair: static_key,
+    } = generate_simple_self_signed(vec!["static.example.org".to_string()]).unwrap();
+    fs::write(&static_cert_path, static_cert.pem()).unwrap();
+    fs::write(&static_key_path, static_key.serialize_pem()).unwrap();
+
+    store
+        .clear_and_reload_static(vec![(
+            vec!["static.example.org".to_string()],
+            static_cert_path,
+            static_key_path,
+        )])
+        .unwrap();
+
+    assert!(store.has_domain("static.example.org"));
+    assert!(store.has_domain("ph-xconnect-gateway-01.svc.plus"));
 }

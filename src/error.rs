@@ -25,6 +25,12 @@ pub enum FluxgateError {
     #[error("TLS error: {0}")]
     TlsError(String),
 
+    #[error("Vault error: {0}")]
+    VaultError(String),
+
+    #[error("ACME error: {0}")]
+    AcmeError(String),
+
     #[error("Generic error: {0}")]
     Generic(String),
 }

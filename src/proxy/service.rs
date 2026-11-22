@@ -1,6 +1,7 @@
 use crate::config::UpstreamTarget;
 use crate::metrics::MetricsRegistry;
 use crate::proxy::route::{uds_path_string, CompiledRouter, RouteResolution};
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pingora::http::{RequestHeader, ResponseHeader};
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct FluxgateProxy {
-    pub router: Arc<CompiledRouter>,
+    pub router: Arc<ArcSwap<CompiledRouter>>,
     pub https_enabled: bool,
     pub metrics: Option<Arc<MetricsRegistry>>,
 }
@@ -40,7 +41,7 @@ impl Default for FluxgateCtx {
 
 impl FluxgateProxy {
     pub fn new(
-        router: Arc<CompiledRouter>,
+        router: Arc<ArcSwap<CompiledRouter>>,
         https_enabled: bool,
         metrics: Option<Arc<MetricsRegistry>>,
     ) -> Self {
@@ -122,7 +123,8 @@ impl ProxyHttp for FluxgateProxy {
         }
 
         let original_uri = session.req_header().uri.clone();
-        match self.router.resolve(&host, &original_uri) {
+        let router = self.router.load();
+        match router.resolve(&host, &original_uri) {
             RouteResolution::Respond { status, body } => {
                 ctx.route_label = "static";
                 Self::send_static_response(session, status, &body).await

@@ -1,0 +1,11 @@
+[Unit]
+Description=Ansible Pull Convergence for Fluxgate Edge Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/ansible-pull/gitops-declaration.env
+EnvironmentFile=-/etc/fluxgate/fluxgate.env
+ExecStart=/usr/bin/ansible-pull -U https://github.com/ai-workspace-infra/playbooks.git -d /var/lib/ansible-pull/playbooks-fluxgate -i localhost, pull_fluxgate.yml
+Nice=10
