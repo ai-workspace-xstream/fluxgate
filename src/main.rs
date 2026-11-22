@@ -18,7 +18,7 @@ use pingora::proxy::http_proxy_service_with_name;
 use pingora::server::configuration::ServerConf;
 use pingora::server::ShutdownWatch;
 use pingora::services::background::{background_service, BackgroundService};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -195,7 +195,7 @@ impl BackgroundService for ConfigReloadService {
     }
 }
 
-fn run_reload_command(pid_file: &PathBuf) {
+fn run_reload_command(pid_file: &Path) {
     let raw = match std::fs::read_to_string(pid_file) {
         Ok(s) => s,
         Err(e) => {
@@ -222,7 +222,7 @@ fn run_reload_command(pid_file: &PathBuf) {
     println!("Sent SIGHUP reload signal to fluxgate PID {}", pid);
 }
 
-fn run_doctor_command(config_path: &PathBuf) {
+fn run_doctor_command(config_path: &Path) {
     init_logging("WARN");
     println!("Fluxgate Doctor (v{})", env!("CARGO_PKG_VERSION"));
     println!("Config: {}", config_path.display());
