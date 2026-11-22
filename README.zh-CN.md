@@ -63,18 +63,28 @@
 | **配置热重载** | 重载时进行进程交接（process handoff） | 平滑重载伴随 Go 内存尖峰 | `ArcSwap` 无锁原子热切换（同 PID，零断流） |
 | **TLS / ACME 与多节点** | 依赖外部 `certbot` / `acme.sh` | 内置 ACME（多节点需外接存储适配器） | 内置纯 Rust ACME DNS-01（`cloudflare` / `alidns`）+ Vault KV v2 CAS 多节点证书共享 + `vault {}` 同步 |
 
-### `v0.2.0` K6 压测与资源消耗实测
+### `v0.2.0` K6 压测与资源消耗实测（macOS 本机客户端）
+
+以下全部 K6 压测均从 **macOS 本机作为客户端**（本地 `xray` 临时客户端 + Docker `grafana/k6:1.7.1`）经真实跨境公网链路发起，分为 **`500` VUs 极限压测** 与 **`40` VUs 可用性压测** 两组：
+
+#### 一组：`500` VUs 极限压测
 
 | 节点 | 引擎与规格 | 压测负载 (VUs / QPS) | 可用率与 P95 延迟 | 压测前内存 | 压测后内存 (RSS / systemd cgroup) | 活跃 TCP 连接 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :---: |
 | `ph-xconnect.svc.plus` | **Fluxgate v0.2.0** (Rust Pingora) | `500` VUs / `176.64 req/s` (`42,551` reqs) | **`100.00%`**, **`264.37 ms`** (**PASS**) | `5.4 MiB` (peak `7.0 MiB`) | **`45.76 MiB`** RSS (cgroup **`33.9 MiB`**, peak `34.2 MiB`) | — |
-| `jp-xconnect-free-01.svc.plus` | **Fluxgate v0.2.0** (`1 vCPU / 967 MiB`) | `80` VUs / `23.31 req/s` (`1,539` reqs) | **`99.94%`**, `2665.35 ms` | `4.8 MiB` cgroup (`15.4 MiB` RSS) | cgroup **`17.0 MiB`** (peak `17.4 MiB`), CPU `1.233s` | `188` |
-| `jp-xconnect-free-01.svc.plus` | **Fluxgate v0.2.0** (`1 vCPU / 967 MiB`) | `40` VUs / `10.92 req/s` (`715` reqs) | **`99.72%`**, `2661.48 ms` | `17.0 MiB` cgroup | `34.3 MiB` RSS (cgroup **`22.1 MiB`**, peak `22.3 MiB`) | `261` |
+| `jp-xconnect-free-01.svc.plus` | **Fluxgate v0.2.0** (`1 vCPU / 967 MiB`) | `500` VUs / `42.30 req/s` (`10,569` reqs) | `98.69%`, `9829.60 ms` | `22.1 MiB` cgroup | **`97.8 MiB`** RSS (cgroup **`92.8 MiB`**, peak `97.8 MiB`) | `124` (测后) |
 | `jp-xconnect-01.svc.plus` | **HAProxy 3.0.11** (`1,936 MiB` RAM) | `500` VUs / `70.82 req/s` (`17,582` reqs) | **`99.82%`**, `4775.94 ms` | `100.6 MiB` RSS (cgroup `121.5 MiB`) | `113.9 MiB` RSS (cgroup `143.8 MiB`, peak `153.2 MiB`) | `403 -> 2121` |
-| `us-xconnect.svc.plus` | **Caddy v2.11.4** (`1 vCPU / 961 MiB`) | `500` VUs / `33.89 req/s` (`8,468` reqs) | `97.37%` (FAIL), `9123.84 ms` | `44.8 MiB` RSS (cgroup `51.0 MiB`) | **`159.8 MiB`** RSS (cgroup **`166.5 MiB`**, swap `13.9 MiB`) | `48 -> 995` |
-| `us-xconnect.svc.plus` | **Caddy v2.11.4** (`1 vCPU / 961 MiB`) | `40` VUs / `9.35 req/s` (`623` reqs) | `99.52%`, `2466.05 ms` | `159.8 MiB` RSS (500VU 后) | `52.8 MiB` RSS (cgroup `58.8 MiB`, 峰值 `248.7 MiB`, swap `13.9 MiB`) | `113` |
+| `us-xconnect.svc.plus` | **Caddy v2.11.4** (`1 vCPU / 961 MiB`) | `500` VUs / `33.89 req/s` (`8,468` reqs) | `97.37%` (FAIL), `9123.84 ms` | `44.8 MiB` RSS (cgroup `51.0 MiB`) | **`159.8 MiB`** RSS (cgroup **`166.5 MiB`**, peak `248.7 MiB`, swap `13.9 MiB`) | `48 -> 995` |
 
-> **实测资源表现对比**：以上全部 K6 压测均从 **macOS 本机作为客户端**（本地 `xray` 临时客户端 + Docker `grafana/k6:1.7.1`）经真实跨境公网链路发起。在同等级 `1 vCPU / ~960 MiB` 小鸡上跑 `40` VUs 负载，**Fluxgate v0.2.0** 仅占用 **`22.1 MiB` cgroup（`34.3 MiB` RSS，峰值 `22.3 MiB`）**；而 **Caddy v2.11.4** 在 `500` VUs 下可用率跌至 `97.37%` 且 RSS 暴涨至 **`159.8 MiB`（cgroup `166.5 MiB`，历史峰值 `248.7 MiB`）**，降回 `40` VUs 并经 GC 回收后仍占 `52.8 MiB` RSS（cgroup `58.8 MiB`、swap `13.9 MiB`）。**HAProxy 3.0.11** 在 `2,121` 条活跃 TCP 连接下表现稳定，RSS 为 `113.9 MiB`（cgroup `143.8 MiB`）。*（注：`jp-xconnect-free-01` 与 `us-xconnect` 受 macOS 本机跨境链路 + Cloudflare `generate_204` 往返影响，40~80 VUs 下 P95 基线约 2.4~2.6s。）*
+#### 二组：`40` VUs 可用性压测
+
+| 节点 | 引擎与规格 | 压测负载 (VUs / QPS) | 可用率与 P95 延迟 | 压测后内存 (RSS / systemd cgroup) | 活跃 TCP 连接 |
+| :--- | :--- | :--- | :--- | :--- | :---: |
+| `jp-xconnect-free-01.svc.plus` | **Fluxgate v0.2.0** (`1 vCPU / 967 MiB`) | `40` VUs / `10.92 req/s` (`715` reqs) | **`99.72%`**, `2661.48 ms` (`P50 691.50 ms`) | **`34.3 MiB`** RSS (cgroup **`22.1 MiB`**, peak `22.3 MiB`) | `261` |
+| `jp-xconnect-01.svc.plus` | **HAProxy 3.0.11** (`1,936 MiB` RAM) | `40` VUs / `14.67 req/s` (`909` reqs) | **`100.00%`**, `2136.90 ms` (`P50 440.58 ms`) | `116.3 MiB` RSS (cgroup `126.8 MiB`, peak `156.2 MiB`) | `322` |
+| `us-xconnect.svc.plus` | **Caddy v2.11.4** (`1 vCPU / 961 MiB`) | `40` VUs / `9.35 req/s` (`623` reqs) | `99.52%`, `2466.05 ms` (`P50 633.87 ms`) | `52.8 MiB` RSS (cgroup `58.8 MiB`, peak `248.7 MiB`, swap `13.9 MiB`) | `113` |
+
+> **实测资源表现对比**：在同等级 `1 vCPU / ~960 MiB` 小鸡上跑 `40` VUs 负载，**Fluxgate v0.2.0** 仅占用 **`22.1 MiB` cgroup（`34.3 MiB` RSS，峰值 `22.3 MiB`）**，即使遭遇 `500` VUs 极限压测也仅 **`97.8 MiB` RSS（cgroup `92.8 MiB`）**；而 **Caddy v2.11.4** 在 `500` VUs 下可用率跌至 `97.37%` 且 RSS 暴涨至 **`159.8 MiB`（cgroup `166.5 MiB`，历史峰值 `248.7 MiB`，swap `13.9 MiB`）**。**HAProxy 3.0.11** 在 `500` VUs（`113.9 MiB` RSS / `143.8 MiB` cgroup）与 `40` VUs（`116.3 MiB` RSS / `126.8 MiB` cgroup）下均保持稳定。*（注：`jp-xconnect-free-01` 与 `us-xconnect` 受 macOS 本机跨境链路 + Cloudflare `generate_204` 往返影响，40 VUs 下 P95 基线约 2.1~2.6s。）*
 
 ---
 

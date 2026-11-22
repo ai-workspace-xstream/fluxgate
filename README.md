@@ -63,18 +63,28 @@ The dashboard below captures live production traffic across multiple 1 vCPU / 1 
 | **Config Reload** | Process handoff on reload | Graceful reload with Go memory spikes | `ArcSwap` lock-free atomic reload (same PID, zero dropped streams) |
 | **TLS / ACME & Multi-Node** | Requires external `certbot` / `acme.sh` | Built-in ACME (multi-node requires external storage adapter) | Built-in pure-Rust ACME DNS-01 (`cloudflare` / `alidns`) + Vault KV v2 CAS multi-node cert sharing + `vault {}` sync |
 
-### `v0.2.0` K6 Stress Test & Resource Usage
+### `v0.2.0` K6 Stress Test & Resource Usage (macOS Local Client)
+
+All K6 benchmarks below were executed from a **macOS local client** (`localhost` temporary Xray client + Docker `grafana/k6:1.7.1`) over real cross-border WAN links.
+
+#### Group A: `500` VUs Extreme Stress Test
 
 | Node | Engine & Spec | Workload (VUs / QPS) | Availability & P95 | Pre-Load Memory | Post-Load Memory (RSS / systemd cgroup) | Active TCP Conns |
 | :--- | :--- | :--- | :--- | :--- | :--- | :---: |
 | `ph-xconnect.svc.plus` | **Fluxgate v0.2.0** (Rust Pingora) | `500` VUs / `176.64 req/s` (`42,551` reqs) | **`100.00%`**, **`264.37 ms`** (**PASS**) | `5.4 MiB` (peak `7.0 MiB`) | **`45.76 MiB`** RSS (cgroup **`33.9 MiB`**, peak `34.2 MiB`) | — |
-| `jp-xconnect-free-01.svc.plus` | **Fluxgate v0.2.0** (`1 vCPU / 967 MiB`) | `80` VUs / `23.31 req/s` (`1,539` reqs) | **`99.94%`**, `2665.35 ms` | `4.8 MiB` cgroup (`15.4 MiB` RSS) | cgroup **`17.0 MiB`** (peak `17.4 MiB`), CPU `1.233s` | `188` |
-| `jp-xconnect-free-01.svc.plus` | **Fluxgate v0.2.0** (`1 vCPU / 967 MiB`) | `40` VUs / `10.92 req/s` (`715` reqs) | **`99.72%`**, `2661.48 ms` | `17.0 MiB` cgroup | `34.3 MiB` RSS (cgroup **`22.1 MiB`**, peak `22.3 MiB`) | `261` |
+| `jp-xconnect-free-01.svc.plus` | **Fluxgate v0.2.0** (`1 vCPU / 967 MiB`) | `500` VUs / `42.30 req/s` (`10,569` reqs) | `98.69%`, `9829.60 ms` | `22.1 MiB` cgroup | **`97.8 MiB`** RSS (cgroup **`92.8 MiB`**, peak `97.8 MiB`) | `124` (post) |
 | `jp-xconnect-01.svc.plus` | **HAProxy 3.0.11** (`1,936 MiB` RAM) | `500` VUs / `70.82 req/s` (`17,582` reqs) | **`99.82%`**, `4775.94 ms` | `100.6 MiB` RSS (cgroup `121.5 MiB`) | `113.9 MiB` RSS (cgroup `143.8 MiB`, peak `153.2 MiB`) | `403 -> 2121` |
-| `us-xconnect.svc.plus` | **Caddy v2.11.4** (`1 vCPU / 961 MiB`) | `500` VUs / `33.89 req/s` (`8,468` reqs) | `97.37%` (FAIL), `9123.84 ms` | `44.8 MiB` RSS (cgroup `51.0 MiB`) | **`159.8 MiB`** RSS (cgroup **`166.5 MiB`**, swap `13.9 MiB`) | `48 -> 995` |
-| `us-xconnect.svc.plus` | **Caddy v2.11.4** (`1 vCPU / 961 MiB`) | `40` VUs / `9.35 req/s` (`623` reqs) | `99.52%`, `2466.05 ms` | `159.8 MiB` RSS (post-500VU) | `52.8 MiB` RSS (cgroup `58.8 MiB`, peak `248.7 MiB`, swap `13.9 MiB`) | `113` |
+| `us-xconnect.svc.plus` | **Caddy v2.11.4** (`1 vCPU / 961 MiB`) | `500` VUs / `33.89 req/s` (`8,468` reqs) | `97.37%` (FAIL), `9123.84 ms` | `44.8 MiB` RSS (cgroup `51.0 MiB`) | **`159.8 MiB`** RSS (cgroup **`166.5 MiB`**, peak `248.7 MiB`, swap `13.9 MiB`) | `48 -> 995` |
 
-> **Observed Resource Behavior**: All K6 benchmarks above were executed from a **macOS local client** (`localhost` temporary Xray client + Docker `grafana/k6:1.7.1`) over real cross-border WAN links. On the same `1 vCPU / ~960 MiB` class under `40` VUs, **Fluxgate v0.2.0** stayed at **`22.1 MiB` cgroup (`34.3 MiB` RSS, peak `22.3 MiB`)**, whereas **Caddy v2.11.4** settled at `52.8 MiB` RSS (`58.8 MiB` cgroup, `13.9 MiB` swap) after spiking to **`159.8 MiB` RSS (`166.5 MiB` cgroup, peak `248.7 MiB`)** under `500` VUs (`97.37%` availability). **HAProxy 3.0.11** remained stable at `113.9 MiB` RSS (`143.8 MiB` cgroup) across `2,121` established TCP connections. *(Note: `jp-xconnect-free-01` and `us-xconnect` have a ~2.4–2.6s macOS-to-edge WAN+Cloudflare P95 floor at 40–80 VUs.)*
+#### Group B: `40` VUs Availability Benchmark
+
+| Node | Engine & Spec | Workload (VUs / QPS) | Availability & P95 | Post-Load Memory (RSS / systemd cgroup) | Active TCP Conns |
+| :--- | :--- | :--- | :--- | :--- | :---: |
+| `jp-xconnect-free-01.svc.plus` | **Fluxgate v0.2.0** (`1 vCPU / 967 MiB`) | `40` VUs / `10.92 req/s` (`715` reqs) | **`99.72%`**, `2661.48 ms` (`P50 691.50 ms`) | **`34.3 MiB`** RSS (cgroup **`22.1 MiB`**, peak `22.3 MiB`) | `261` |
+| `jp-xconnect-01.svc.plus` | **HAProxy 3.0.11** (`1,936 MiB` RAM) | `40` VUs / `14.67 req/s` (`909` reqs) | **`100.00%`**, `2136.90 ms` (`P50 440.58 ms`) | `116.3 MiB` RSS (cgroup `126.8 MiB`, peak `156.2 MiB`) | `322` |
+| `us-xconnect.svc.plus` | **Caddy v2.11.4** (`1 vCPU / 961 MiB`) | `40` VUs / `9.35 req/s` (`623` reqs) | `99.52%`, `2466.05 ms` (`P50 633.87 ms`) | `52.8 MiB` RSS (cgroup `58.8 MiB`, peak `248.7 MiB`, swap `13.9 MiB`) | `113` |
+
+> **Observed Resource Behavior**: On the same `1 vCPU / ~960 MiB` class under `40` VUs, **Fluxgate v0.2.0** used only **`22.1 MiB` cgroup (`34.3 MiB` RSS, peak `22.3 MiB`)** and reached `97.8 MiB` RSS (`92.8 MiB` cgroup) even under a `500`-VU blast, whereas **Caddy v2.11.4** spiked to **`159.8 MiB` RSS (`166.5 MiB` cgroup, peak `248.7 MiB`, swap `13.9 MiB`)** with `97.37%` availability under `500` VUs. **HAProxy 3.0.11** stayed stable across both `500` VUs (`113.9 MiB` RSS / `143.8 MiB` cgroup) and `40` VUs (`116.3 MiB` RSS / `126.8 MiB` cgroup). *(Note: `jp-xconnect-free-01` and `us-xconnect` have a ~2.4–2.6s macOS-to-edge WAN+Cloudflare P95 floor at 40 VUs.)*
 
 ---
 
