@@ -103,13 +103,7 @@ impl MetricsRegistry {
         }
     }
 
-    pub fn record_vault_sync(
-        &self,
-        alias: &str,
-        success: bool,
-        version: u64,
-        timestamp_secs: i64,
-    ) {
+    pub fn record_vault_sync(&self, alias: &str, success: bool, version: u64, timestamp_secs: i64) {
         if let Ok(mut map) = self.vault_sync.lock() {
             let entry = map.entry(alias.to_string()).or_default();
             entry.success = success;

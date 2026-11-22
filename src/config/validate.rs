@@ -209,11 +209,7 @@ fn validate_site(
     Ok(())
 }
 
-fn validate_tls(
-    tls: &TlsConfig,
-    vault_aliases: &HashSet<&str>,
-    strict_gitops: bool,
-) -> Result<()> {
+fn validate_tls(tls: &TlsConfig, vault_aliases: &HashSet<&str>, strict_gitops: bool) -> Result<()> {
     match tls {
         TlsConfig::Static {
             cert_path,

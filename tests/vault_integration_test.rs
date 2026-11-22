@@ -242,7 +242,10 @@ async fn dispatch_request(
 
     if method == "POST" && path == "/v1/auth/approle/login" {
         let req_json: Value = serde_json::from_slice(body_bytes).unwrap_or(Value::Null);
-        let role_id = req_json.get("role_id").and_then(Value::as_str).unwrap_or("");
+        let role_id = req_json
+            .get("role_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let secret_id = req_json
             .get("secret_id")
             .and_then(Value::as_str)
@@ -488,7 +491,10 @@ async fn test_approle_login_renew_and_403_reauth() {
     }
 
     assert_eq!(
-        store.get_secret("dns", "alidns_access_key_id").unwrap().as_str(),
+        store
+            .get_secret("dns", "alidns_access_key_id")
+            .unwrap()
+            .as_str(),
         "ak-id-001"
     );
     assert_eq!(

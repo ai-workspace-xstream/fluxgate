@@ -596,11 +596,7 @@ impl Parser {
         })
     }
 
-    fn parse_vault_block(
-        &self,
-        cursor: &mut TokenCursor,
-        open_tok: &Token,
-    ) -> Result<VaultConfig> {
+    fn parse_vault_block(&self, cursor: &mut TokenCursor, open_tok: &Token) -> Result<VaultConfig> {
         let mut addr = SecretRef::Env("VAULT_ADDR".to_string());
         let mut namespace = None;
         let mut auth = VaultAuthMode::AppRole;
@@ -690,11 +686,7 @@ impl Parser {
         })
     }
 
-    fn parse_tls_block(
-        &self,
-        cursor: &mut TokenCursor,
-        open_tok: &Token,
-    ) -> Result<AcmeTlsConfig> {
+    fn parse_tls_block(&self, cursor: &mut TokenCursor, open_tok: &Token) -> Result<AcmeTlsConfig> {
         let mut email = String::new();
         let mut ca_url = LETSENCRYPT_PROD_DIRECTORY.to_string();
         let mut dns_provider: Option<DnsProviderConfig> = None;
@@ -736,14 +728,12 @@ impl Parser {
             match sub_word.as_str() {
                 "issuer" => {
                     let kind_tok = cursor.expect_word("TLS issuer type (acme)")?;
-                    if kind_tok.kind_word() != "acme" {
+                    let kind_word = kind_tok.kind_word();
+                    if kind_word != "acme" {
                         return Err(FluxgateError::ConfigSyntax {
                             file: kind_tok.file,
                             line: kind_tok.line,
-                            msg: format!(
-                                "Unsupported TLS issuer '{}', expected 'acme'",
-                                kind_tok.kind_word()
-                            ),
+                            msg: format!("Unsupported TLS issuer '{}', expected 'acme'", kind_word),
                         });
                     }
                     cursor.expect(TokenKind::OpenBrace, "open brace '{' for issuer acme")?;
@@ -886,13 +876,22 @@ impl Parser {
 }
 
 pub fn parse_secret_ref(s: &str) -> SecretRef {
-    if let Some(inner) = s.strip_prefix("env(").and_then(|rest| rest.strip_suffix(')')) {
+    if let Some(inner) = s
+        .strip_prefix("env(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
         return SecretRef::Env(inner.trim().to_string());
     }
-    if let Some(inner) = s.strip_prefix("{env.").and_then(|rest| rest.strip_suffix('}')) {
+    if let Some(inner) = s
+        .strip_prefix("{env.")
+        .and_then(|rest| rest.strip_suffix('}'))
+    {
         return SecretRef::Env(inner.trim().to_string());
     }
-    if let Some(inner) = s.strip_prefix("{vault.").and_then(|rest| rest.strip_suffix('}')) {
+    if let Some(inner) = s
+        .strip_prefix("{vault.")
+        .and_then(|rest| rest.strip_suffix('}'))
+    {
         return if let Some((alias, key)) = inner.split_once('.') {
             SecretRef::Vault {
                 alias: alias.to_string(),
@@ -920,7 +919,10 @@ fn parse_duration_secs(tok: &Token) -> Result<u64> {
         (raw.as_str(), 1u64)
     };
 
-    let val = num_str.parse::<u64>().ok().and_then(|n| n.checked_mul(mult));
+    let val = num_str
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult));
     val.ok_or_else(|| FluxgateError::ConfigSyntax {
         file: tok.file.clone(),
         line: tok.line,
@@ -946,7 +948,10 @@ fn parse_renew_before_days(tok: &Token) -> Result<u64> {
     Err(FluxgateError::ConfigSyntax {
         file: tok.file.clone(),
         line: tok.line,
-        msg: format!("Invalid renew_before duration '{}' (expected <N>d or <N>h)", raw),
+        msg: format!(
+            "Invalid renew_before duration '{}' (expected <N>d or <N>h)",
+            raw
+        ),
     })
 }
 

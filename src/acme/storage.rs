@@ -252,7 +252,8 @@ fn write_atomic_file(path: &Path, content: &[u8], mode: u32) -> Result<()> {
 #[async_trait]
 pub trait VaultKvStore: Send + Sync {
     async fn read_kv2_json(&self, kv_path: &str) -> Result<Option<(serde_json::Value, u64)>>;
-    async fn write_kv2_cas(&self, kv_path: &str, data: &serde_json::Value, cas: u64) -> Result<u64>;
+    async fn write_kv2_cas(&self, kv_path: &str, data: &serde_json::Value, cas: u64)
+        -> Result<u64>;
 }
 
 #[async_trait]
@@ -283,9 +284,25 @@ struct VaultCertRecord {
     renew_lock_until: i64,
 }
 
-impl Drop for VaultCertRecord {
+struct ZeroizeVaultCertRecord(VaultCertRecord);
+
+impl std::ops::Deref for ZeroizeVaultCertRecord {
+    type Target = VaultCertRecord;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ZeroizeVaultCertRecord {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ZeroizeVaultCertRecord {
     fn drop(&mut self) {
-        self.key_pem.zeroize();
+        self.0.key_pem.zeroize();
     }
 }
 
@@ -343,9 +360,9 @@ impl VaultSharedCertStorage {
             return Ok(None);
         };
 
-        let mut record: VaultCertRecord = serde_json::from_value(val).map_err(|e| {
+        let mut record = ZeroizeVaultCertRecord(serde_json::from_value(val).map_err(|e| {
             FluxgateError::VaultError(format!("Failed to decode Vault cert record: {}", e))
-        })?;
+        })?);
 
         if record.cert_pem.trim().is_empty() || record.key_pem.trim().is_empty() {
             return Ok(None);
@@ -386,9 +403,9 @@ impl VaultSharedCertStorage {
         let now = current_unix_timestamp();
         let lock_until = now.saturating_add(lease_secs as i64);
 
-        let (mut record, expected_cas) = match self.client.read_kv2_json(&path).await? {
+        let (record, expected_cas) = match self.client.read_kv2_json(&path).await? {
             None => (
-                VaultCertRecord {
+                ZeroizeVaultCertRecord(VaultCertRecord {
                     domains: domains.to_vec(),
                     cert_pem: String::new(),
                     key_pem: String::new(),
@@ -396,13 +413,17 @@ impl VaultSharedCertStorage {
                     updated_by: String::new(),
                     renew_owner: self.node_id.clone(),
                     renew_lock_until: lock_until,
-                },
+                }),
                 0,
             ),
             Some((val, version)) => {
-                let mut existing: VaultCertRecord = serde_json::from_value(val).map_err(|e| {
-                    FluxgateError::VaultError(format!("Failed to decode Vault cert record: {}", e))
-                })?;
+                let mut existing =
+                    ZeroizeVaultCertRecord(serde_json::from_value(val).map_err(|e| {
+                        FluxgateError::VaultError(format!(
+                            "Failed to decode Vault cert record: {}",
+                            e
+                        ))
+                    })?);
 
                 if existing.renew_lock_until > now
                     && !existing.renew_owner.is_empty()
@@ -420,12 +441,16 @@ impl VaultSharedCertStorage {
             }
         };
 
-        let payload = serde_json::to_value(&record).map_err(|e| {
+        let payload = serde_json::to_value(&*record).map_err(|e| {
             FluxgateError::VaultError(format!("Failed to encode Vault lock record: {}", e))
         })?;
-        record.key_pem.zeroize();
+        drop(record);
 
-        match self.client.write_kv2_cas(&path, &payload, expected_cas).await {
+        match self
+            .client
+            .write_kv2_cas(&path, &payload, expected_cas)
+            .await
+        {
             Ok(new_version) => Ok(Some(new_version)),
             Err(e) if is_cas_conflict_error(&e) => Ok(None),
             Err(e) => Err(e),
@@ -445,7 +470,7 @@ impl VaultSharedCertStorage {
             bundle.domains.clone()
         };
 
-        let mut record = VaultCertRecord {
+        let record = ZeroizeVaultCertRecord(VaultCertRecord {
             domains: record_domains,
             cert_pem: bundle.cert_pem.clone(),
             key_pem: bundle.key_pem.as_str().to_string(),
@@ -453,14 +478,18 @@ impl VaultSharedCertStorage {
             updated_by: self.node_id.clone(),
             renew_owner: String::new(),
             renew_lock_until: 0,
-        };
+        });
 
-        let payload = serde_json::to_value(&record).map_err(|e| {
+        let payload = serde_json::to_value(&*record).map_err(|e| {
             FluxgateError::VaultError(format!("Failed to encode Vault cert record: {}", e))
         })?;
-        record.key_pem.zeroize();
+        drop(record);
 
-        match self.client.write_kv2_cas(&path, &payload, expected_version).await {
+        match self
+            .client
+            .write_kv2_cas(&path, &payload, expected_version)
+            .await
+        {
             Ok(ver) => Ok(ver),
             Err(e) if is_cas_conflict_error(&e) => {
                 let latest_ver = match self.client.read_kv2_json(&path).await? {

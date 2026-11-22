@@ -199,11 +199,7 @@ fn run_reload_command(pid_file: &PathBuf) {
     let raw = match std::fs::read_to_string(pid_file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
-                "Failed to read PID file {}: {}",
-                pid_file.display(),
-                e
-            );
+            eprintln!("Failed to read PID file {}: {}", pid_file.display(), e);
             process::exit(1);
         }
     };

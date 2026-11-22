@@ -37,8 +37,8 @@ pub fn build_tls_settings(tls: &TlsConfig) -> Result<TlsSettings> {
 }
 
 pub fn build_dynamic_tls_settings(store: Arc<DynamicCertStore>) -> Result<TlsSettings> {
-    let mut settings =
-        TlsSettings::with_callbacks(Box::new(DynamicTlsAccept::new(store))).map_err(|e| {
+    let mut settings = TlsSettings::with_callbacks(Box::new(DynamicTlsAccept::new(store)))
+        .map_err(|e| {
             FluxgateError::TlsError(format!("Failed to initialize dynamic TLS callbacks: {}", e))
         })?;
     settings.enable_h2();
@@ -208,7 +208,10 @@ impl DynamicTlsAccept {
 #[async_trait]
 impl TlsAccept for DynamicTlsAccept {
     async fn certificate_callback(&self, ssl: &mut TlsRef) {
-        let sni = ssl.servername(NameType::HOST_NAME).unwrap_or("").to_string();
+        let sni = ssl
+            .servername(NameType::HOST_NAME)
+            .unwrap_or("")
+            .to_string();
 
         if let Some((leaf, chain, key)) = self.store.lookup_sni(&sni) {
             if let Err(e) = ext::ssl_use_certificate(ssl, &leaf) {
@@ -276,9 +279,8 @@ fn build_cert_entry(
     let leaf = certs.remove(0);
     let chain = certs;
 
-    let key = PKey::private_key_from_pem(key_pem.as_bytes()).map_err(|e| {
-        FluxgateError::TlsError(format!("Failed to parse private key PEM: {}", e))
-    })?;
+    let key = PKey::private_key_from_pem(key_pem.as_bytes())
+        .map_err(|e| FluxgateError::TlsError(format!("Failed to parse private key PEM: {}", e)))?;
 
     let effective_not_after = if not_after_unix > 0 {
         not_after_unix
@@ -325,16 +327,25 @@ fn normalize_domains(domains: &[String]) -> Vec<String> {
 
 fn normalize_host(host: &str) -> String {
     let clean = host.trim().trim_end_matches('.');
-    clean.split(':').next().unwrap_or(clean).to_ascii_lowercase()
+    clean
+        .split(':')
+        .next()
+        .unwrap_or(clean)
+        .to_ascii_lowercase()
 }
 
 fn find_exact<'a>(entries: &'a [CertEntry], target: &str) -> Option<&'a CertEntry> {
-    entries.iter().find(|entry| entry.domains.iter().any(|d| d == target))
+    entries
+        .iter()
+        .find(|entry| entry.domains.iter().any(|d| d == target))
 }
 
 fn find_wildcard<'a>(entries: &'a [CertEntry], target: &str) -> Option<&'a CertEntry> {
     entries.iter().find(|entry| {
-        entry.domains.iter().any(|d| matches_single_level_wildcard(d, target))
+        entry
+            .domains
+            .iter()
+            .any(|d| matches_single_level_wildcard(d, target))
     })
 }
 

@@ -394,7 +394,9 @@ impl VaultClient {
             data,
         };
 
-        let resp = self.send_authed(|client| client.post(&url).json(&body)).await?;
+        let resp = self
+            .send_authed(|client| client.post(&url).json(&body))
+            .await?;
 
         let status = resp.status();
         if status == StatusCode::BAD_REQUEST || status == StatusCode::CONFLICT {
@@ -608,9 +610,7 @@ impl VaultClient {
         })?;
 
         let auth = parsed.auth.ok_or_else(|| {
-            FluxgateError::VaultError(
-                "Vault renew-self response missing 'auth' object".to_string(),
-            )
+            FluxgateError::VaultError("Vault renew-self response missing 'auth' object".to_string())
         })?;
 
         let tok = if auth.client_token.is_empty() {

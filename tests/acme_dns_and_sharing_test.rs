@@ -178,7 +178,9 @@ async fn test_cloudflare_dns_present_and_cleanup() {
                 let mut guard = recorded_srv.lock().unwrap();
                 guard.push(req);
             }
-            write_http_response(&mut stream, status, reason, body).await.unwrap();
+            write_http_response(&mut stream, status, reason, body)
+                .await
+                .unwrap();
         }
     });
 
@@ -187,7 +189,11 @@ async fn test_cloudflare_dns_present_and_cleanup() {
         .with_base_url(format!("http://{}", addr));
 
     let guard = provider
-        .present("sub.svc.plus", "_acme-challenge.sub.svc.plus", "cf-txt-token")
+        .present(
+            "sub.svc.plus",
+            "_acme-challenge.sub.svc.plus",
+            "cf-txt-token",
+        )
         .await
         .unwrap();
 
@@ -338,7 +344,9 @@ async fn test_alidns_present_and_cleanup_mock_http() {
                 other => panic!("Unexpected AliDNS action: {}", other),
             };
 
-            write_http_response(&mut stream, 200, "OK", body).await.unwrap();
+            write_http_response(&mut stream, 200, "OK", body)
+                .await
+                .unwrap();
         }
     });
 
@@ -350,7 +358,11 @@ async fn test_alidns_present_and_cleanup_mock_http() {
     .with_endpoint(format!("http://{}", addr));
 
     let guard = provider
-        .present("sub.svc.plus", "_acme-challenge.sub.svc.plus", "ali-txt-token")
+        .present(
+            "sub.svc.plus",
+            "_acme-challenge.sub.svc.plus",
+            "ali-txt-token",
+        )
         .await
         .unwrap();
 
@@ -371,7 +383,10 @@ async fn test_alidns_present_and_cleanup_mock_http() {
 
 #[test]
 fn test_parse_cert_not_after_and_local_storage_permissions_and_roundtrip() {
-    let domains = vec!["*.svc.plus".to_string(), "jp-xconnect-02.svc.plus".to_string()];
+    let domains = vec![
+        "*.svc.plus".to_string(),
+        "jp-xconnect-02.svc.plus".to_string(),
+    ];
     let CertifiedKey { cert, key_pair } = generate_simple_self_signed(domains.clone()).unwrap();
     let cert_pem = cert.pem();
     let key_pem = Zeroizing::new(key_pair.serialize_pem());
@@ -432,7 +447,10 @@ fn test_parse_cert_not_after_and_local_storage_permissions_and_roundtrip() {
         assert_eq!(key_mode, 0o600);
     }
 
-    let reversed_domains = vec!["jp-xconnect-02.svc.plus".to_string(), "*.svc.plus".to_string()];
+    let reversed_domains = vec![
+        "jp-xconnect-02.svc.plus".to_string(),
+        "*.svc.plus".to_string(),
+    ];
     let loaded = storage.load_cert(&reversed_domains).unwrap().unwrap();
     assert_eq!(loaded.cert_pem, cert_pem);
     assert_eq!(loaded.key_pem.as_str(), key_pem.as_str());
@@ -486,7 +504,8 @@ async fn spawn_mock_vault_kv2_server() -> String {
                         403,
                         "Forbidden",
                         r#"{"errors":["permission denied"]}"#,
-                    ).await;
+                    )
+                    .await;
                     return;
                 }
 
@@ -501,7 +520,8 @@ async fn spawn_mock_vault_kv2_server() -> String {
                                     "data": val,
                                     "metadata": { "version": ver }
                                 }
-                            }).to_string();
+                            })
+                            .to_string();
                             (200, "OK", body)
                         } else {
                             (404, "Not Found", r#"{"errors":[]}"#.to_string())
@@ -560,7 +580,10 @@ async fn test_vault_two_node_concurrent_cas_lock_and_cert_sharing() {
         "node-b",
     ));
 
-    let domains = vec!["*.svc.plus".to_string(), "jp-xconnect-02.svc.plus".to_string()];
+    let domains = vec![
+        "*.svc.plus".to_string(),
+        "jp-xconnect-02.svc.plus".to_string(),
+    ];
 
     // Test A: Concurrent CAS lock acquisition -> exactly one node wins.
     let barrier = Arc::new(Barrier::new(2));
@@ -633,12 +656,14 @@ async fn test_vault_two_node_concurrent_cas_lock_and_cert_sharing() {
     assert_eq!(loaded.not_after_unix, not_after_unix);
 
     let cert_store = DynamicCertStore::new();
-    cert_store.upsert_pem(
-        &loaded.domains,
-        &loaded.cert_pem,
-        loaded.key_pem.as_str(),
-        loaded.not_after_unix,
-    ).unwrap();
+    cert_store
+        .upsert_pem(
+            &loaded.domains,
+            &loaded.cert_pem,
+            loaded.key_pem.as_str(),
+            loaded.not_after_unix,
+        )
+        .unwrap();
     assert!(cert_store.has_domain("jp-xconnect-02.svc.plus"));
     assert!(cert_store.has_domain("api.svc.plus"));
     assert_eq!(cert_store.get_expiry("api.svc.plus"), Some(not_after_unix));

@@ -134,7 +134,9 @@ impl AcmeCertManager {
             }
         }
 
-        let issued = self.issue_certificate(domains, &tls_cfg.email, &tls_cfg.ca_url, dns).await?;
+        let issued = self
+            .issue_certificate(domains, &tls_cfg.email, &tls_cfg.ca_url, dns)
+            .await?;
         self.local_storage.save_cert(&issued)?;
         Ok((issued, RenewalOutcome::Renewed))
     }
@@ -175,7 +177,9 @@ impl AcmeCertManager {
             let issued = self
                 .issue_certificate(domains, &tls_cfg.email, &tls_cfg.ca_url, dns)
                 .await?;
-            vault.publish_cert_and_release_lock(domains, &issued, lock_version).await?;
+            vault
+                .publish_cert_and_release_lock(domains, &issued, lock_version)
+                .await?;
             if let Err(e) = self.local_storage.save_cert(&issued) {
                 tracing::warn!(
                     domains = %domains.join(","),
@@ -252,9 +256,15 @@ impl AcmeCertManager {
                     terms_of_service_agreed: true,
                     only_return_existing: false,
                 };
-                let (acc, creds) = Account::create(&new_account, ca_url, None).await.map_err(|e| {
-                    FluxgateError::AcmeError(format!("Failed to create ACME account: {}", e))
-                })?;
+                let (acc, creds) =
+                    Account::create(&new_account, ca_url, None)
+                        .await
+                        .map_err(|e| {
+                            FluxgateError::AcmeError(format!(
+                                "Failed to create ACME account: {}",
+                                e
+                            ))
+                        })?;
                 self.local_storage.save_account_credentials(&creds)?;
                 acc
             }
@@ -265,12 +275,15 @@ impl AcmeCertManager {
         let new_order = NewOrder {
             identifiers: &identifiers,
         };
-        let mut order = account.new_order(&new_order).await.map_err(|e| {
-            FluxgateError::AcmeError(format!("Failed to create ACME order: {}", e))
-        })?;
+        let mut order = account
+            .new_order(&new_order)
+            .await
+            .map_err(|e| FluxgateError::AcmeError(format!("Failed to create ACME order: {}", e)))?;
 
         let mut guards: Vec<DnsRecordGuard> = Vec::new();
-        let result = self.complete_order(&mut order, domains, dns, &mut guards).await;
+        let result = self
+            .complete_order(&mut order, domains, dns, &mut guards)
+            .await;
 
         for guard in &guards {
             if let Err(err) = dns.cleanup(guard).await {
@@ -379,9 +392,9 @@ impl AcmeCertManager {
         let params = rcgen::CertificateParams::new(domains.to_vec()).map_err(|e| {
             FluxgateError::AcmeError(format!("Failed to create CSR parameters: {}", e))
         })?;
-        let csr = params.serialize_request(&kp).map_err(|e| {
-            FluxgateError::AcmeError(format!("Failed to generate CSR: {}", e))
-        })?;
+        let csr = params
+            .serialize_request(&kp)
+            .map_err(|e| FluxgateError::AcmeError(format!("Failed to generate CSR: {}", e)))?;
         let key_pem = Zeroizing::new(kp.serialize_pem());
 
         if order.state().status != OrderStatus::Valid {
@@ -538,7 +551,10 @@ impl CertRenewalService {
         };
 
         let manager = AcmeCertManager::new(local_storage, vault_storage);
-        match manager.ensure_valid_cert(domains, tls_cfg, dns.as_ref()).await {
+        match manager
+            .ensure_valid_cert(domains, tls_cfg, dns.as_ref())
+            .await
+        {
             Ok((bundle, outcome)) => {
                 if let Err(e) = self.cert_store.upsert_pem(
                     &bundle.domains,

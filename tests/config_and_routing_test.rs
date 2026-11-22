@@ -1,8 +1,8 @@
 use arc_swap::ArcSwap;
 use fluxgate::config::{
     compute_config_hash, load_config, load_config_with_options, parse_secret_ref,
-    DnsProviderConfig, LETSENCRYPT_PROD_DIRECTORY, LETSENCRYPT_STAGING_DIRECTORY, SecretRef,
-    TlsConfig, UpstreamTarget, ValidateOptions, VaultAuthMode,
+    DnsProviderConfig, SecretRef, TlsConfig, UpstreamTarget, ValidateOptions, VaultAuthMode,
+    LETSENCRYPT_PROD_DIRECTORY, LETSENCRYPT_STAGING_DIRECTORY,
 };
 use fluxgate::proxy::route::RouteResolution;
 use fluxgate::proxy::CompiledRouter;
@@ -271,9 +271,15 @@ fn test_vault_block_and_placeholder_parsing() {
     let cfg = load_config(&main_file).unwrap();
     let vault = cfg.global.vault.as_ref().expect("expected vault config");
     assert_eq!(vault.addr, SecretRef::Env("VAULT_ADDR".to_string()));
-    assert_eq!(vault.namespace, Some(SecretRef::Env("VAULT_NAMESPACE".to_string())));
+    assert_eq!(
+        vault.namespace,
+        Some(SecretRef::Env("VAULT_NAMESPACE".to_string()))
+    );
     assert_eq!(vault.auth, VaultAuthMode::AppRole);
-    assert_eq!(vault.ca_cert.as_deref(), Some(Path::new("/etc/fluxgate/vault-ca.pem")));
+    assert_eq!(
+        vault.ca_cert.as_deref(),
+        Some(Path::new("/etc/fluxgate/vault-ca.pem"))
+    );
     assert_eq!(vault.syncs.len(), 2);
     assert_eq!(vault.syncs[0].alias, "dns");
     assert_eq!(vault.syncs[0].kv_path, "kv/data/prod/fluxgate/dns");
@@ -286,7 +292,10 @@ fn test_vault_block_and_placeholder_parsing() {
             assert_eq!(acme.email, "ops@svc.plus");
             assert_eq!(acme.ca_url, LETSENCRYPT_STAGING_DIRECTORY);
             assert_eq!(acme.renew_before_days, 30);
-            assert_eq!(acme.vault_storage_path.as_deref(), Some("kv/data/prod/fluxgate/certs"));
+            assert_eq!(
+                acme.vault_storage_path.as_deref(),
+                Some("kv/data/prod/fluxgate/certs")
+            );
             assert_eq!(
                 acme.dns_provider,
                 DnsProviderConfig::Cloudflare {
@@ -515,7 +524,11 @@ a.svc.plus {
     )
     .unwrap();
     let err = load_config(&bad_vault_dir).unwrap_err();
-    assert!(err.to_string().contains("unknown_vault_option"), "got: {}", err);
+    assert!(
+        err.to_string().contains("unknown_vault_option"),
+        "got: {}",
+        err
+    );
 
     let bad_tls_dir = dir.path().join("bad_tls_dir.conf");
     fs::write(
@@ -531,7 +544,11 @@ a.svc.plus {
     )
     .unwrap();
     let err = load_config(&bad_tls_dir).unwrap_err();
-    assert!(err.to_string().contains("unknown_tls_option"), "got: {}", err);
+    assert!(
+        err.to_string().contains("unknown_tls_option"),
+        "got: {}",
+        err
+    );
 
     // build_tls_settings rejects ACME config and directs caller to dynamic TLS
     let acme_cfg = load_config(&gitops_ok_file).unwrap();
@@ -588,7 +605,10 @@ a.svc.plus {
 #[test]
 fn test_dynamic_cert_store_sni_and_hot_replacement() {
     let store = DynamicCertStore::new();
-    let domains = vec!["*.svc.plus".to_string(), "jp-xconnect-02.svc.plus".to_string()];
+    let domains = vec![
+        "*.svc.plus".to_string(),
+        "jp-xconnect-02.svc.plus".to_string(),
+    ];
 
     let CertifiedKey {
         cert: cert1,
@@ -597,7 +617,9 @@ fn test_dynamic_cert_store_sni_and_hot_replacement() {
     let cert1_pem = cert1.pem();
     let key1_pem = key1.serialize_pem();
 
-    store.upsert_pem(&domains, &cert1_pem, &key1_pem, 0).unwrap();
+    store
+        .upsert_pem(&domains, &cert1_pem, &key1_pem, 0)
+        .unwrap();
 
     assert_eq!(store.domain_count(), 2);
     assert!(store.has_domain("jp-xconnect-02.svc.plus"));
@@ -609,7 +631,9 @@ fn test_dynamic_cert_store_sni_and_hot_replacement() {
     assert!(store.lookup_sni("jp-xconnect-02.svc.plus").is_some());
     assert!(store.lookup_sni("JP-XCONNECT-02.SVC.PLUS").is_some());
     assert!(store.lookup_sni("*.svc.plus").is_some());
-    assert!(store.lookup_sni("ph-xconnect-gateway-01.svc.plus").is_some());
+    assert!(store
+        .lookup_sni("ph-xconnect-gateway-01.svc.plus")
+        .is_some());
     assert!(store.lookup_sni("a.b.svc.plus").is_none());
     assert!(store.lookup_sni("other.example.com").is_none());
     assert!(store.lookup_sni("").is_some());
@@ -624,15 +648,23 @@ fn test_dynamic_cert_store_sni_and_hot_replacement() {
     } = generate_simple_self_signed(domains.clone()).unwrap();
     let cert2_pem = cert2.pem();
     let key2_pem = key2.serialize_pem();
-    let expected_der = X509::from_pem(cert2_pem.as_bytes()).unwrap().to_der().unwrap();
+    let expected_der = X509::from_pem(cert2_pem.as_bytes())
+        .unwrap()
+        .to_der()
+        .unwrap();
 
-    store.upsert_pem(&domains, &cert2_pem, &key2_pem, 1_950_000_000).unwrap();
+    store
+        .upsert_pem(&domains, &cert2_pem, &key2_pem, 1_950_000_000)
+        .unwrap();
 
     let (after_leaf, _, _) = store.lookup_sni("ph-xconnect-gateway-01.svc.plus").unwrap();
     let after_der = after_leaf.to_der().unwrap();
     assert_ne!(before_der, after_der);
     assert_eq!(after_der, expected_der);
-    assert_eq!(store.get_expiry("ph-xconnect-gateway-01.svc.plus"), Some(1_950_000_000));
+    assert_eq!(
+        store.get_expiry("ph-xconnect-gateway-01.svc.plus"),
+        Some(1_950_000_000)
+    );
 
     // Reloading static certs preserves ACME certs
     let dir = tempdir().unwrap();
