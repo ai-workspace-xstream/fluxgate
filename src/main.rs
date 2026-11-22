@@ -457,8 +457,12 @@ fn main() {
             server_conf.pid_file = "/tmp/fluxgate.pid".to_string();
             server_conf.upgrade_sock = "/tmp/fluxgate_upgrade.sock".to_string();
 
+            let pid_file = server_conf.pid_file.clone();
             let mut server = Server::new_with_opt_and_conf(None, server_conf);
             server.bootstrap();
+            if let Err(e) = std::fs::write(&pid_file, format!("{}\n", std::process::id())) {
+                tracing::warn!("Failed to write PID file {}: {}", pid_file, e);
+            }
 
             let metrics_registry = cfg
                 .global
