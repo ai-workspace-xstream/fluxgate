@@ -72,9 +72,9 @@ All K6 benchmarks below were executed from a **macOS local client** (`localhost`
 | Node | Engine & Spec | Workload (VUs / QPS) | Availability & P95 | Pre-Load Memory | Post-Load Memory (RSS / systemd cgroup) | Active TCP Conns |
 | :--- | :--- | :--- | :--- | :--- | :--- | :---: |
 | `ph-xconnect.svc.plus` | **Fluxgate v0.2.0** (Rust Pingora) | `500` VUs / `176.64 req/s` (`42,551` reqs) | **`100.00%`**, **`264.37 ms`** (**PASS**) | `5.4 MiB` (peak `7.0 MiB`) | **`45.76 MiB`** RSS (cgroup **`33.9 MiB`**, peak `34.2 MiB`) | — |
-| `jp-xconnect-free-01.svc.plus` | **Fluxgate v0.2.0** (`1 vCPU / 967 MiB`) | `500` VUs / `42.30 req/s` (`10,569` reqs) | `98.69%`, `9829.60 ms` | `22.1 MiB` cgroup | **`97.8 MiB`** RSS (cgroup **`92.8 MiB`**, peak `97.8 MiB`) | `124` (post) |
-| `jp-xconnect-01.svc.plus` | **HAProxy 3.0.11** (`1,936 MiB` RAM) | `500` VUs / `70.82 req/s` (`17,582` reqs) | **`99.82%`**, `4775.94 ms` | `100.6 MiB` RSS (cgroup `121.5 MiB`) | `113.9 MiB` RSS (cgroup `143.8 MiB`, peak `153.2 MiB`) | `403 -> 2121` |
-| `us-xconnect.svc.plus` | **Caddy v2.11.4** (`1 vCPU / 961 MiB`) | `500` VUs / `33.89 req/s` (`8,468` reqs) | `97.37%` (FAIL), `9123.84 ms` | `44.8 MiB` RSS (cgroup `51.0 MiB`) | **`159.8 MiB`** RSS (cgroup **`166.5 MiB`**, peak `248.7 MiB`, swap `13.9 MiB`) | `48 -> 995` |
+| `jp-xconnect-free-01.svc.plus` | **Fluxgate v0.2.0** (`1 vCPU / 967 MiB`) | `500` VUs / **`118.79 req/s`** (`28,905` reqs) | **`99.94%`**, `1773.19 ms` | `97.9 MiB` RSS (cgroup `93.3 MiB`) | **`105.3 MiB`** RSS (cgroup **`102.1 MiB`**, peak `102.5 MiB`) | `149 -> 1083` |
+| `jp-xconnect-01.svc.plus` | **HAProxy 3.0.11** (`1,936 MiB` RAM) | `500` VUs / **`147.04 req/s`** (`35,511` reqs) | **`100.00%`**, **`1079.42 ms`** (**PASS**) | `117.4 MiB` RSS (cgroup `131.1 MiB`) | **`118.3 MiB`** RSS (cgroup `141.4 MiB`, peak `156.2 MiB`) | `313 -> 1841` |
+| `us-xconnect.svc.plus` | **Caddy v2.11.4** (`1 vCPU / 961 MiB`) | `500` VUs / `111.01 req/s` (`27,407` reqs) | **`99.95%`**, `1833.13 ms` | `41.2 MiB` RSS (cgroup `47.2 MiB`) | **`171.4 MiB`** RSS (cgroup **`177.8 MiB`**, peak `248.7 MiB`, swap `13.8 MiB`) | `38 -> 1019` |
 
 #### Group B: `40` VUs Availability Benchmark
 
@@ -84,7 +84,7 @@ All K6 benchmarks below were executed from a **macOS local client** (`localhost`
 | `jp-xconnect-01.svc.plus` | **HAProxy 3.0.11** (`1,936 MiB` RAM) | `40` VUs / `14.67 req/s` (`909` reqs) | **`100.00%`**, `2136.90 ms` (`P50 440.58 ms`) | `116.3 MiB` RSS (cgroup `126.8 MiB`, peak `156.2 MiB`) | `322` |
 | `us-xconnect.svc.plus` | **Caddy v2.11.4** (`1 vCPU / 961 MiB`) | `40` VUs / `9.35 req/s` (`623` reqs) | `99.52%`, `2466.05 ms` (`P50 633.87 ms`) | `52.8 MiB` RSS (cgroup `58.8 MiB`, peak `248.7 MiB`, swap `13.9 MiB`) | `113` |
 
-> **Observed Resource Behavior**: On the same `1 vCPU / ~960 MiB` class under `40` VUs, **Fluxgate v0.2.0** used only **`22.1 MiB` cgroup (`34.3 MiB` RSS, peak `22.3 MiB`)** and reached `97.8 MiB` RSS (`92.8 MiB` cgroup) even under a `500`-VU blast, whereas **Caddy v2.11.4** spiked to **`159.8 MiB` RSS (`166.5 MiB` cgroup, peak `248.7 MiB`, swap `13.9 MiB`)** with `97.37%` availability under `500` VUs. **HAProxy 3.0.11** stayed stable across both `500` VUs (`113.9 MiB` RSS / `143.8 MiB` cgroup) and `40` VUs (`116.3 MiB` RSS / `126.8 MiB` cgroup). *(Note: `jp-xconnect-free-01` and `us-xconnect` have a ~2.4–2.6s macOS-to-edge WAN+Cloudflare P95 floor at 40 VUs.)*
+> **Observed Resource Behavior**: On the same `1 vCPU / ~960 MiB` class under `40` VUs, **Fluxgate v0.2.0** used only **`22.1 MiB` cgroup (`34.3 MiB` RSS, peak `22.3 MiB`)**, and under a `500`-VU blast (`118.79 req/s`, `99.94%` avail) its RSS grew by just `+7.4 MiB` (`97.9 -> 105.3 MiB` RSS / `102.1 MiB` cgroup). By contrast, **Caddy v2.11.4** (`111.01 req/s`, `99.95%` avail) jumped `+130.2 MiB` (**4.16x**) from `41.2 MiB` to **`171.4 MiB` RSS (`177.8 MiB` cgroup, peak `248.7 MiB`, swap `13.8 MiB`)**. **HAProxy 3.0.11** stayed rock-solid at **`118.3 MiB` RSS (`141.4 MiB` cgroup)** across `1,841` established connections (`147.04 req/s`, `100.00%` avail, `P95 1079.42 ms`).
 
 ---
 
