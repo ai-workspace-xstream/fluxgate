@@ -371,22 +371,62 @@ fn validate_directive(
                 ));
             }
         }
-        Directive::ReverseProxy(rp) => match &rp.upstream {
-            UpstreamTarget::Uds(p) => {
-                if p.as_os_str().is_empty() {
-                    return Err(FluxgateError::ConfigValidation(
-                        "Unix socket upstream path cannot be empty".to_string(),
-                    ));
+        Directive::ReverseProxy(rp) => {
+            match &rp.upstream {
+                UpstreamTarget::Uds(p) => {
+                    if p.as_os_str().is_empty() {
+                        return Err(FluxgateError::ConfigValidation(
+                            "Unix socket upstream path cannot be empty".to_string(),
+                        ));
+                    }
+                }
+                UpstreamTarget::Tcp(addr) => {
+                    if addr.is_empty() {
+                        return Err(FluxgateError::ConfigValidation(
+                            "TCP upstream address cannot be empty".to_string(),
+                        ));
+                    }
                 }
             }
-            UpstreamTarget::Tcp(addr) => {
-                if addr.is_empty() {
-                    return Err(FluxgateError::ConfigValidation(
-                        "TCP upstream address cannot be empty".to_string(),
-                    ));
-                }
+
+            const MAX_H2_WINDOW_SIZE: u32 = (1u32 << 31) - 1;
+            if rp.transport.h2_stream_window_size == 0
+                || rp.transport.h2_stream_window_size > MAX_H2_WINDOW_SIZE
+            {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "h2_stream_window_size must be between 1 and {} bytes",
+                    MAX_H2_WINDOW_SIZE
+                )));
             }
-        },
+            if rp.transport.h2_connection_window_size == 0
+                || rp.transport.h2_connection_window_size > MAX_H2_WINDOW_SIZE
+            {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "h2_connection_window_size must be between 1 and {} bytes",
+                    MAX_H2_WINDOW_SIZE
+                )));
+            }
+            if rp.transport.max_h2_streams == 0 {
+                return Err(FluxgateError::ConfigValidation(
+                    "max_h2_streams must be at least 1".to_string(),
+                ));
+            }
+            if rp.transport.h2_ping_interval_secs == 0 {
+                return Err(FluxgateError::ConfigValidation(
+                    "h2_ping_interval must be at least 1s".to_string(),
+                ));
+            }
+            if rp.transport.read_timeout_secs == 0 {
+                return Err(FluxgateError::ConfigValidation(
+                    "read_timeout must be at least 1s".to_string(),
+                ));
+            }
+            if rp.transport.idle_timeout_secs == 0 {
+                return Err(FluxgateError::ConfigValidation(
+                    "idle_timeout must be at least 1s".to_string(),
+                ));
+            }
+        }
         Directive::Respond(resp) => {
             if strict_gitops && has_secret_markers(&resp.body) {
                 return Err(FluxgateError::ConfigValidation(

@@ -543,22 +543,31 @@ impl Parser {
                         flush_interval = val.parse::<i32>().unwrap_or(-1);
                     }
                     "transport" => {
-                        let proto = cursor
-                            .expect_word("transport protocol (e.g. http)")?
-                            .kind_word();
-                        if proto == "http" {
-                            cursor.expect(TokenKind::OpenBrace, "open brace '{' for transport")?;
-                            while let Some(tk) = cursor.peek_kind() {
-                                if *tk == TokenKind::CloseBrace {
-                                    cursor.next();
-                                    break;
-                                }
-                                if *tk == TokenKind::Newline {
-                                    cursor.next();
-                                    continue;
-                                }
-                                let t_tok = cursor.next().unwrap();
-                                if t_tok.kind_word() == "versions" {
+                        let proto_tok = cursor.expect_word("transport protocol (e.g. http)")?;
+                        let proto = proto_tok.kind_word();
+                        if proto != "http" {
+                            return Err(FluxgateError::ConfigSyntax {
+                                file: proto_tok.file,
+                                line: proto_tok.line,
+                                msg: format!(
+                                    "Unsupported transport protocol '{}' (expected 'http')",
+                                    proto
+                                ),
+                            });
+                        }
+                        cursor.expect(TokenKind::OpenBrace, "open brace '{' for transport")?;
+                        while let Some(tk) = cursor.peek_kind() {
+                            if *tk == TokenKind::CloseBrace {
+                                cursor.next();
+                                break;
+                            }
+                            if *tk == TokenKind::Newline {
+                                cursor.next();
+                                continue;
+                            }
+                            let t_tok = cursor.next().unwrap();
+                            match t_tok.kind_word().as_str() {
+                                "versions" => {
                                     while let Some(vk) = cursor.peek_kind() {
                                         if *vk == TokenKind::Newline || *vk == TokenKind::CloseBrace
                                         {
@@ -574,6 +583,56 @@ impl Parser {
                                             break;
                                         }
                                     }
+                                }
+                                "h2_stream_window_size" => {
+                                    let val_tok =
+                                        cursor.expect_word("h2_stream_window_size value")?;
+                                    transport.h2_stream_window_size =
+                                        parse_byte_size_u32(&val_tok)?;
+                                }
+                                "h2_connection_window_size" => {
+                                    let val_tok =
+                                        cursor.expect_word("h2_connection_window_size value")?;
+                                    transport.h2_connection_window_size =
+                                        parse_byte_size_u32(&val_tok)?;
+                                }
+                                "h2_ping_interval" | "h2_ping_interval_secs" => {
+                                    let val_tok = cursor.expect_word("h2_ping_interval value")?;
+                                    transport.h2_ping_interval_secs =
+                                        parse_duration_secs(&val_tok)?;
+                                }
+                                "max_h2_streams" => {
+                                    let val_tok = cursor.expect_word("max_h2_streams value")?;
+                                    let raw = val_tok.kind_word();
+                                    transport.max_h2_streams =
+                                        raw.parse::<usize>().map_err(|_| {
+                                            FluxgateError::ConfigSyntax {
+                                                file: val_tok.file,
+                                                line: val_tok.line,
+                                                msg: format!(
+                                                "Invalid max_h2_streams '{}' (expected integer)",
+                                                raw
+                                            ),
+                                            }
+                                        })?;
+                                }
+                                "read_timeout" | "read_timeout_secs" => {
+                                    let val_tok = cursor.expect_word("read_timeout value")?;
+                                    transport.read_timeout_secs = parse_duration_secs(&val_tok)?;
+                                }
+                                "idle_timeout" | "idle_timeout_secs" => {
+                                    let val_tok = cursor.expect_word("idle_timeout value")?;
+                                    transport.idle_timeout_secs = parse_duration_secs(&val_tok)?;
+                                }
+                                other => {
+                                    return Err(FluxgateError::ConfigSyntax {
+                                        file: t_tok.file,
+                                        line: t_tok.line,
+                                        msg: format!(
+                                            "Unrecognized transport http sub-directive '{}'",
+                                            other
+                                        ),
+                                    });
                                 }
                             }
                         }
@@ -905,6 +964,42 @@ pub fn parse_secret_ref(s: &str) -> SecretRef {
         };
     }
     SecretRef::Literal(s.to_string())
+}
+
+fn parse_byte_size_u32(tok: &Token) -> Result<u32> {
+    let raw = tok.kind_word();
+    let lower = raw.to_ascii_lowercase();
+    let (num_str, mult): (&str, u64) = if let Some(n) = lower.strip_suffix("mib") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix("mb") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix('m') {
+        (n, 1024 * 1024)
+    } else if let Some(n) = lower.strip_suffix("kib") {
+        (n, 1024)
+    } else if let Some(n) = lower.strip_suffix("kb") {
+        (n, 1024)
+    } else if let Some(n) = lower.strip_suffix('k') {
+        (n, 1024)
+    } else if let Some(n) = lower.strip_suffix('b') {
+        (n, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+
+    let val = num_str
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .and_then(|n| u32::try_from(n).ok());
+    val.ok_or_else(|| FluxgateError::ConfigSyntax {
+        file: tok.file.clone(),
+        line: tok.line,
+        msg: format!(
+            "Invalid byte size '{}' (expected e.g. 4194304, 4MiB, 16m)",
+            raw
+        ),
+    })
 }
 
 fn parse_duration_secs(tok: &Token) -> Result<u64> {

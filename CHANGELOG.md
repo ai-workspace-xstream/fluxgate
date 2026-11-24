@@ -5,6 +5,16 @@ All notable changes to **Fluxgate** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-25
+
+### Changed & Added
+- **Low-Latency H2 / XHTTP Media Streaming & Configurability (`transport http {}`)**:
+  - Raised default HTTP/2 cleartext (`h2c`) upstream flow-control and multiplexing parameters for voice/photo streaming: `h2_stream_window_size` (`4 MiB`), `h2_connection_window_size` (`16 MiB`), `h2_ping_interval_secs` (`15s`), and `max_h2_streams` (`256`).
+  - Extended `TransportConfig` and the `transport http { ... }` DSL block to support explicit `h2_stream_window_size`, `h2_connection_window_size`, `h2_ping_interval` / `h2_ping_interval_secs`, `max_h2_streams`, `read_timeout` / `read_timeout_secs`, and `idle_timeout` / `idle_timeout_secs` (with `validate_config` bounds checking).
+  - Configured Pingora downstream `H2Options` (`4 MiB` stream window, `16 MiB` connection window, `256` max concurrent streams) and `HttpServerOptions::h2_idle_timeout` (`3600s`).
+  - Enabled `tcp_fast_open = true` and `TcpKeepalive` (`60s` idle, `15s` interval, `4` probes) on upstream peers and listening TCP/TLS sockets (`tcp_fastopen: Some(256)`).
+  - Aligned downstream `Session` read/write/keepalive timeouts with route transport config, disabled buffering compression when `flush_immediately` (`flush_interval -1`) is active, and allowed safe pre-header retries for idempotent requests hitting stale reused/GOAWAY/`REFUSED_STREAM` upstream H2 connections while blocking unsafe retries on streaming uploads.
+
 ## [0.2.0] - 2026-11-22
 
 ### Added
