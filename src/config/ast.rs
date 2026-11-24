@@ -153,6 +153,13 @@ pub enum Directive {
     Respond(RespondConfig),
 }
 
+pub const DEFAULT_H2_STREAM_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
+pub const DEFAULT_H2_CONNECTION_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
+pub const DEFAULT_H2_PING_INTERVAL_SECS: u64 = 15;
+pub const DEFAULT_MAX_H2_STREAMS: usize = 256;
+pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 3600;
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 3600;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReverseProxyConfig {
     pub upstream: UpstreamTarget,
@@ -170,6 +177,12 @@ pub enum UpstreamTarget {
 pub struct TransportConfig {
     pub versions: Vec<String>, // e.g. ["h2c", "2"] or ["1.1"]
     pub h2c: bool,
+    pub h2_stream_window_size: u32,
+    pub h2_connection_window_size: u32,
+    pub h2_ping_interval_secs: u64,
+    pub max_h2_streams: usize,
+    pub read_timeout_secs: u64,
+    pub idle_timeout_secs: u64,
 }
 
 impl Default for TransportConfig {
@@ -177,6 +190,12 @@ impl Default for TransportConfig {
         Self {
             versions: vec!["1.1".to_string()],
             h2c: false,
+            h2_stream_window_size: DEFAULT_H2_STREAM_WINDOW_SIZE,
+            h2_connection_window_size: DEFAULT_H2_CONNECTION_WINDOW_SIZE,
+            h2_ping_interval_secs: DEFAULT_H2_PING_INTERVAL_SECS,
+            max_h2_streams: DEFAULT_MAX_H2_STREAMS,
+            read_timeout_secs: DEFAULT_READ_TIMEOUT_SECS,
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
         }
     }
 }

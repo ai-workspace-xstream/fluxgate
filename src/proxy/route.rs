@@ -49,8 +49,8 @@ pub enum RouteAction {
 pub enum RouteResolution {
     Proxy {
         upstream: UpstreamTarget,
-        h2c: bool,
         flush_immediately: bool,
+        transport: crate::config::TransportConfig,
         new_uri: Option<Uri>,
     },
     Respond {
@@ -238,8 +238,8 @@ impl CompiledSite {
                     };
                     return RouteResolution::Proxy {
                         upstream: rp.upstream.clone(),
-                        h2c: rp.transport.h2c,
                         flush_immediately: rp.flush_interval < 0,
+                        transport: rp.transport.clone(),
                         new_uri,
                     };
                 }
@@ -386,12 +386,12 @@ jp-xconnect-01.svc.plus jp-xconnect-02.svc.plus {
         match res {
             RouteResolution::Proxy {
                 upstream,
-                h2c,
+                transport,
                 new_uri,
                 ..
             } => {
                 assert_eq!(upstream, UpstreamTarget::Tcp("127.0.0.1:8080".to_string()));
-                assert!(!h2c);
+                assert!(!transport.h2c);
                 assert_eq!(new_uri.unwrap().to_string(), "/snapshots?w=1");
             }
             other => panic!("Expected Proxy, got {:?}", other),
@@ -405,15 +405,15 @@ jp-xconnect-01.svc.plus jp-xconnect-02.svc.plus {
         match res {
             RouteResolution::Proxy {
                 upstream,
-                h2c,
                 flush_immediately,
+                transport,
                 new_uri,
             } => {
                 assert_eq!(
                     upstream,
                     UpstreamTarget::Uds(PathBuf::from("/dev/shm/xray.sock"))
                 );
-                assert!(h2c);
+                assert!(transport.h2c);
                 assert!(flush_immediately);
                 assert_eq!(new_uri.unwrap().to_string(), "/split/");
             }

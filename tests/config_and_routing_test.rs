@@ -172,15 +172,21 @@ jp-xconnect-01.svc.plus jp-xconnect-02.svc.plus jp-xconnect.svc.plus tky-proxy.s
         match router.resolve(host, &"/split?x_padding=12345".parse().unwrap()) {
             RouteResolution::Proxy {
                 upstream,
-                h2c,
                 flush_immediately,
+                transport,
                 new_uri,
             } => {
                 assert_eq!(
                     upstream,
                     UpstreamTarget::Uds(PathBuf::from("/dev/shm/xray.sock"))
                 );
-                assert!(h2c);
+                assert!(transport.h2c);
+                assert_eq!(transport.h2_stream_window_size, 4 * 1024 * 1024);
+                assert_eq!(transport.h2_connection_window_size, 16 * 1024 * 1024);
+                assert_eq!(transport.h2_ping_interval_secs, 15);
+                assert_eq!(transport.max_h2_streams, 256);
+                assert_eq!(transport.read_timeout_secs, 3600);
+                assert_eq!(transport.idle_timeout_secs, 3600);
                 assert!(flush_immediately);
                 assert_eq!(new_uri.unwrap().to_string(), "/split/");
             }
@@ -219,7 +225,7 @@ jp-xconnect-01.svc.plus {
     match router.resolve("jp-xconnect-01.svc.plus", &"/split".parse().unwrap()) {
         RouteResolution::Proxy {
             upstream,
-            h2c,
+            transport,
             new_uri,
             ..
         } => {
@@ -227,7 +233,11 @@ jp-xconnect-01.svc.plus {
                 upstream,
                 UpstreamTarget::Uds(PathBuf::from("/dev/shm/xray.sock"))
             );
-            assert!(h2c);
+            assert!(transport.h2c);
+            assert_eq!(transport.h2_stream_window_size, 4 * 1024 * 1024);
+            assert_eq!(transport.h2_connection_window_size, 16 * 1024 * 1024);
+            assert_eq!(transport.h2_ping_interval_secs, 15);
+            assert_eq!(transport.max_h2_streams, 256);
             assert!(new_uri.is_none());
         }
         other => panic!("Expected unix+h2c proxy, got {:?}", other),
@@ -690,4 +700,89 @@ fn test_dynamic_cert_store_sni_and_hot_replacement() {
 
     assert!(store.has_domain("static.example.org"));
     assert!(store.has_domain("ph-xconnect-gateway-01.svc.plus"));
+}
+
+#[test]
+fn test_transport_http_custom_tuning_and_validation() {
+    let dir = tempdir().unwrap();
+    let main_file = dir.path().join("Fluxgatefile");
+    fs::write(
+        &main_file,
+        r#"
+jp-xconnect-02.svc.plus {
+    @xhttp {
+        path /split /split/*
+    }
+    handle @xhttp {
+        reverse_proxy unix//dev/shm/xray.sock {
+            flush_interval -1
+            transport http {
+                versions h2c 2
+                h2_stream_window_size 8MiB
+                h2_connection_window_size 32m
+                h2_ping_interval 10s
+                max_h2_streams 512
+                read_timeout 7200s
+                idle_timeout_secs 1800
+            }
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let cfg = load_config(&main_file).unwrap();
+    let router = CompiledRouter::compile(&cfg);
+    match router.resolve("jp-xconnect-02.svc.plus", &"/split/abc".parse().unwrap()) {
+        RouteResolution::Proxy {
+            transport,
+            flush_immediately,
+            ..
+        } => {
+            assert!(transport.h2c);
+            assert!(flush_immediately);
+            assert_eq!(transport.h2_stream_window_size, 8 * 1024 * 1024);
+            assert_eq!(transport.h2_connection_window_size, 32 * 1024 * 1024);
+            assert_eq!(transport.h2_ping_interval_secs, 10);
+            assert_eq!(transport.max_h2_streams, 512);
+            assert_eq!(transport.read_timeout_secs, 7200);
+            assert_eq!(transport.idle_timeout_secs, 1800);
+        }
+        other => panic!("Expected Proxy, got {:?}", other),
+    }
+
+    // Invalid bounds (zero stream window / zero max_h2_streams / unknown directive)
+    let bad_zero = dir.path().join("BadZeroFluxgatefile");
+    fs::write(
+        &bad_zero,
+        r#"
+jp-xconnect-02.svc.plus {
+    reverse_proxy unix//dev/shm/xray.sock {
+        transport http {
+            versions h2c 2
+            max_h2_streams 0
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    assert!(load_config(&bad_zero).is_err());
+
+    let bad_unknown = dir.path().join("BadUnknownFluxgatefile");
+    fs::write(
+        &bad_unknown,
+        r#"
+jp-xconnect-02.svc.plus {
+    reverse_proxy unix//dev/shm/xray.sock {
+        transport http {
+            unknown_knob 123
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    assert!(load_config(&bad_unknown).is_err());
 }

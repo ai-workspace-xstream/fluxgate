@@ -1,4 +1,4 @@
-use crate::config::UpstreamTarget;
+use crate::config::{TransportConfig, UpstreamTarget};
 use crate::metrics::MetricsRegistry;
 use crate::proxy::route::{uds_path_string, CompiledRouter, RouteResolution};
 use arc_swap::ArcSwap;
@@ -6,8 +6,19 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::prelude::*;
+use pingora::protocols::TcpKeepalive;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+pub fn default_tcp_keepalive() -> TcpKeepalive {
+    TcpKeepalive {
+        idle: Duration::from_secs(60),
+        interval: Duration::from_secs(15),
+        count: 4,
+        #[cfg(target_os = "linux")]
+        user_timeout: Duration::from_secs(60),
+    }
+}
 
 pub struct FluxgateProxy {
     pub router: Arc<ArcSwap<CompiledRouter>>,
@@ -17,7 +28,7 @@ pub struct FluxgateProxy {
 
 pub struct FluxgateCtx {
     pub upstream: Option<UpstreamTarget>,
-    pub h2c: bool,
+    pub transport: TransportConfig,
     pub flush_immediately: bool,
     pub host: String,
     pub route_label: &'static str,
@@ -29,7 +40,7 @@ impl Default for FluxgateCtx {
     fn default() -> Self {
         Self {
             upstream: None,
-            h2c: false,
+            transport: TransportConfig::default(),
             flush_immediately: false,
             host: String::new(),
             route_label: "unknown",
@@ -135,8 +146,8 @@ impl ProxyHttp for FluxgateProxy {
             }
             RouteResolution::Proxy {
                 upstream,
-                h2c,
                 flush_immediately,
+                transport,
                 new_uri,
             } => {
                 ctx.route_label = match &upstream {
@@ -146,8 +157,16 @@ impl ProxyHttp for FluxgateProxy {
                 if let Some(uri) = new_uri {
                     session.req_header_mut().set_uri(uri);
                 }
+                let rw_timeout = Duration::from_secs(transport.read_timeout_secs);
+                session.set_read_timeout(Some(rw_timeout));
+                session.set_write_timeout(Some(rw_timeout));
+                session.set_keepalive(Some(transport.idle_timeout_secs));
+                if flush_immediately {
+                    // Never allow compression buffering to delay small voice/photo frames
+                    session.upstream_compression.adjust_level(0);
+                }
                 ctx.upstream = Some(upstream);
-                ctx.h2c = h2c;
+                ctx.transport = transport;
                 ctx.flush_immediately = flush_immediately;
                 Ok(false)
             }
@@ -174,21 +193,39 @@ impl ProxyHttp for FluxgateProxy {
             UpstreamTarget::Tcp(addr) => HttpPeer::new(addr, false, String::new()),
         };
 
-        if ctx.h2c {
+        if ctx.transport.h2c {
             // Enforce h2c (HTTP/2 cleartext prior knowledge); do not silently downgrade to H1.1
             peer.options.set_http_version(2, 2);
-            peer.options.max_h2_streams = 128;
-            peer.options.h2_stream_window_size = Some(1024 * 1024);
-            peer.options.h2_connection_window_size = Some(4 * 1024 * 1024);
-            peer.options.h2_ping_interval = Some(Duration::from_secs(30));
+            peer.options.max_h2_streams = ctx.transport.max_h2_streams;
+            peer.options.h2_stream_window_size = Some(ctx.transport.h2_stream_window_size);
+            peer.options.h2_connection_window_size = Some(ctx.transport.h2_connection_window_size);
+            peer.options.h2_ping_interval =
+                Some(Duration::from_secs(ctx.transport.h2_ping_interval_secs));
         }
 
+        let rw_timeout = Duration::from_secs(ctx.transport.read_timeout_secs);
         peer.options.connection_timeout = Some(Duration::from_secs(5));
-        peer.options.read_timeout = Some(Duration::from_secs(3600));
-        peer.options.write_timeout = Some(Duration::from_secs(3600));
-        peer.options.idle_timeout = Some(Duration::from_secs(3600));
+        peer.options.read_timeout = Some(rw_timeout);
+        peer.options.write_timeout = Some(rw_timeout);
+        peer.options.idle_timeout = Some(Duration::from_secs(ctx.transport.idle_timeout_secs));
+        peer.options.tcp_fast_open = true;
+        peer.options.tcp_keepalive = Some(default_tcp_keepalive());
 
         Ok(Box::new(peer))
+    }
+
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> pingora::Result<Option<Duration>> {
+        if ctx.flush_immediately {
+            // Zero flush delay on streaming frames (`flush_interval -1`)
+            return Ok(None);
+        }
+        Ok(None)
     }
 
     async fn upstream_request_filter(
@@ -229,14 +266,26 @@ impl ProxyHttp for FluxgateProxy {
     fn error_while_proxy(
         &self,
         peer: &HttpPeer,
-        _session: &mut Session,
+        session: &mut Session,
         e: Box<Error>,
-        _ctx: &mut Self::CTX,
-        _client_reused: bool,
+        ctx: &mut Self::CTX,
+        client_reused: bool,
     ) -> Box<Error> {
-        let mut e = e.more_context(format!("Peer: {}", peer));
-        // Never retry streaming / UDS requests
-        e.set_retry(false);
+        let mut e = e.more_context(format!(
+            "Peer: {} (h2c={}, reused={})",
+            peer, ctx.transport.h2c, client_reused
+        ));
+        // Only allow safe retries on idempotent requests before response headers are sent
+        // (e.g., GOAWAY/REFUSED_STREAM or stale pooled H2 connections). Never replay
+        // non-idempotent streaming uploads or truncated request bodies.
+        if session.req_header().method.is_idempotent()
+            && !session.as_ref().retry_buffer_truncated()
+            && session.response_written().is_none()
+        {
+            e.retry.decide_reuse(client_reused);
+        } else {
+            e.set_retry(false);
+        }
         e
     }
 
@@ -286,5 +335,43 @@ impl ProxyHttp for FluxgateProxy {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        DEFAULT_H2_CONNECTION_WINDOW_SIZE, DEFAULT_H2_PING_INTERVAL_SECS,
+        DEFAULT_H2_STREAM_WINDOW_SIZE, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_H2_STREAMS,
+        DEFAULT_READ_TIMEOUT_SECS,
+    };
+
+    #[test]
+    fn test_default_tcp_keepalive_and_transport_defaults() {
+        let ka = default_tcp_keepalive();
+        assert_eq!(ka.idle, Duration::from_secs(60));
+        assert_eq!(ka.interval, Duration::from_secs(15));
+        assert_eq!(ka.count, 4);
+        #[cfg(target_os = "linux")]
+        assert_eq!(ka.user_timeout, Duration::from_secs(60));
+
+        let transport = TransportConfig::default();
+        assert!(!transport.h2c);
+        assert_eq!(
+            transport.h2_stream_window_size,
+            DEFAULT_H2_STREAM_WINDOW_SIZE
+        );
+        assert_eq!(
+            transport.h2_connection_window_size,
+            DEFAULT_H2_CONNECTION_WINDOW_SIZE
+        );
+        assert_eq!(
+            transport.h2_ping_interval_secs,
+            DEFAULT_H2_PING_INTERVAL_SECS
+        );
+        assert_eq!(transport.max_h2_streams, DEFAULT_MAX_H2_STREAMS);
+        assert_eq!(transport.read_timeout_secs, DEFAULT_READ_TIMEOUT_SECS);
+        assert_eq!(transport.idle_timeout_secs, DEFAULT_IDLE_TIMEOUT_SECS);
     }
 }

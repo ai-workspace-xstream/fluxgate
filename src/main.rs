@@ -6,14 +6,18 @@ use fluxgate::acme::CertRenewalService;
 use fluxgate::cli::{Cli, Commands};
 use fluxgate::config::{
     compute_config_hash, load_config, load_config_with_options, AcmeTlsConfig, FluxgateConfig,
-    TlsConfig, ValidateOptions,
+    TlsConfig, ValidateOptions, DEFAULT_H2_CONNECTION_WINDOW_SIZE, DEFAULT_H2_STREAM_WINDOW_SIZE,
+    DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_H2_STREAMS,
 };
 use fluxgate::metrics::{MetricsRegistry, MetricsService};
+use fluxgate::proxy::service::default_tcp_keepalive;
 use fluxgate::proxy::{CompiledRouter, FluxgateProxy};
 use fluxgate::tls::{build_dynamic_tls_settings, DynamicCertStore};
 use fluxgate::vault::{SecretStore, VaultClient, VaultSyncService};
+use pingora::apps::HttpServerOptions;
 use pingora::listeners::TcpSocketOptions;
 use pingora::prelude::*;
+use pingora::protocols::http::v2::server::default_h2_options;
 use pingora::proxy::http_proxy_service_with_name;
 use pingora::server::configuration::ServerConf;
 use pingora::server::ShutdownWatch;
@@ -21,7 +25,7 @@ use pingora::services::background::{background_service, BackgroundService};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::signal::unix::{signal, SignalKind};
 use tracing_subscriber::EnvFilter;
 
@@ -548,14 +552,30 @@ fn main() {
             let mut service =
                 http_proxy_service_with_name(&server.configuration, proxy, "Fluxgate HTTP Proxy");
 
-            // Bind HTTP port
-            let mut v6_only_opt = TcpSocketOptions::default();
-            v6_only_opt.ipv6_only = Some(true);
+            if let Some(app) = service.app_logic_mut() {
+                let mut h2_opts = default_h2_options();
+                h2_opts.initial_window_size(DEFAULT_H2_STREAM_WINDOW_SIZE);
+                h2_opts.initial_connection_window_size(DEFAULT_H2_CONNECTION_WINDOW_SIZE);
+                h2_opts.max_concurrent_streams(DEFAULT_MAX_H2_STREAMS as u32);
+                app.h2_options = Some(h2_opts);
+
+                let mut server_opts = HttpServerOptions::default();
+                server_opts.h2_idle_timeout = Some(Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
+                app.server_options = Some(server_opts);
+            }
+
+            // Configure low-latency TCP options (TFO + keepalive) on HTTP and HTTPS listeners
+            let mut tcp_opt_v4 = TcpSocketOptions::default();
+            tcp_opt_v4.tcp_fastopen = Some(256);
+            tcp_opt_v4.tcp_keepalive = Some(default_tcp_keepalive());
+
+            let mut tcp_opt_v6 = tcp_opt_v4.clone();
+            tcp_opt_v6.ipv6_only = Some(true);
 
             let http_v4 = format!("0.0.0.0:{}", cfg.global.http_port);
             let http_v6 = format!("[::]:{}", cfg.global.http_port);
-            service.add_tcp(&http_v4);
-            service.add_tcp_with_settings(&http_v6, v6_only_opt.clone());
+            service.add_tcp_with_settings(&http_v4, tcp_opt_v4.clone());
+            service.add_tcp_with_settings(&http_v6, tcp_opt_v6.clone());
             tracing::info!("Listening HTTP on {} and {}", http_v4, http_v6);
 
             // Bind HTTPS port if TLS is configured
@@ -571,8 +591,8 @@ fn main() {
 
                 let https_v4 = format!("0.0.0.0:{}", cfg.global.https_port);
                 let https_v6 = format!("[::]:{}", cfg.global.https_port);
-                service.add_tls_with_settings(&https_v4, None, tls_v4);
-                service.add_tls_with_settings(&https_v6, Some(v6_only_opt), tls_v6);
+                service.add_tls_with_settings(&https_v4, Some(tcp_opt_v4), tls_v4);
+                service.add_tls_with_settings(&https_v6, Some(tcp_opt_v6), tls_v6);
                 tracing::info!("Listening HTTPS (H2/H1.1) on {} and {}", https_v4, https_v6);
             }
 
