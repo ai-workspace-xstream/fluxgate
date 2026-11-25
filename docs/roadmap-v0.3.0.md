@@ -430,15 +430,56 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
 - `fluxgate_swarm_decisions_total{group="jp-plus",decision="local|spillover|failover|forced_local_hop"}`（Counter：选路决策分布）
 - `fluxgate_swarm_spillover_requests_total{group="jp-plus",target_peer="..."}`（Counter：溢出至各 Peer 的请求数）
 - `fluxgate_swarm_spillover_active_streams{group="jp-plus",target_peer="..."}`（Gauge：当前正溢出至各 Peer 的并发流数）
+- `fluxgate_swarm_local_active_streams{group="jp-plus",node_id="..."}`（Gauge：本机 UDS 当前活跃连接/流数，对标 HAProxy `show stat` 的 `scur`，用于排空归零验收）
+- `fluxgate_swarm_manual_weight{group="jp-plus",target="local|<peer>"}`（Gauge `0~100`：当前人工覆写的运行时调度权重；未覆写时为 `-1`）
 - `fluxgate_gtm_is_coordinator{group="jp-plus"}`（Gauge `1`/`0`：本节点是否持有当前 GTM Coordinator CAS 锁）
 - `fluxgate_gtm_node_weight{group="jp-plus",entrypoint="jp-xconnect-plus.svc.plus",node="...",provider="cloudflare|alidns"}`（Gauge：当前生效的各节点 DNS GTM 权重/挂载状态）
 - `fluxgate_gtm_reconcile_total{group="jp-plus",provider="cloudflare|alidns",result="updated|noop|error"}`（Counter：DNS GTM 对账结果计数）
 
-#### 2.5.2 CLI 子命令增强
+#### 2.5.2 本地 `admin.sock` 运行时权重热调度（对标 HAProxy `admin.sock`）
+
+在滚动升级与慢节点应急处置场景下，仅靠“全量 `drain`（0/100）”或等待 DNS TTL 往往粒度过粗。参考生产已验证的 HAProxy 3.0 零中断切流实践（`echo "set server be_xray_xhttp/xray weight 0" | socat stdio /run/haproxy/admin.sock`），`v0.3.0` 新增**无须 `reload`、不断存量长连接的运行时本地权重热调度能力**：
+
+1. **本地管理 Socket 与轻量文本协议（`/run/fluxgate/admin.sock`，`mode 0660`）**
+   - 在 `swarm { ... }` 中默认开启 `admin_socket /run/fluxgate/admin.sock`（仅限本机 `root` / `fluxgate` 组读写，不暴露公网端口）。
+   - 同时支持 `fluxgate swarm weight ...` CLI 与 `socat stdio /run/fluxgate/admin.sock` 文本指令，直接复用运维习惯：
+     ```bash
+     # 1. 渐进灰度切流：80/20 -> 50/50 -> 20/80 -> 0/100（无需 reload，存量长连接不断）
+     echo "set weight local 80" | socat stdio /run/fluxgate/admin.sock
+     echo "set weight jp-xconnect-02.svc.plus 20" | socat stdio /run/fluxgate/admin.sock
+
+     echo "set weight local 0" | socat stdio /run/fluxgate/admin.sock
+     echo "set weight jp-xconnect-02.svc.plus 100" | socat stdio /run/fluxgate/admin.sock
+
+     # 等价 CLI（支持可选 --ttl 防止运维忘记恢复，超时自动回退至自动水位模式）
+     fluxgate swarm weight set local=0 jp-xconnect-02.svc.plus=100 --ttl 30m
+
+     # 2. 实时观测本机与各 Peer 活跃连接数与生效权重（对标 HAProxy show stat）
+     echo "show stat" | socat stdio /run/fluxgate/admin.sock
+     # 输出示例（CSV，兼容既有脚本与监控解析）：
+     # target,scur,status,weight,mode
+     # local,0,UP,0,manual
+     # jp-xconnect-02.svc.plus,14,UP,100,manual
+
+     # 3. 恢复自动水位自治模式
+     echo "reset weight" | socat stdio /run/fluxgate/admin.sock
+     # 或 fluxgate swarm weight reset
+     ```
+2. **热路径选路优先级与安全兜底（Zero-Lock `ArcSwap`）**
+   - 运行时权重存储在 `ArcSwap<Option<ManualWeightPolicy>>` 中，更新原子生效、请求热路径零锁竞争。
+   - **选路优先级**：`1-Hop 防环（强制本地 UDS）` > `人工权重覆写（ManualWeightPolicy）` > `自动三段式水位溢出（Swarm P2C）` > `本机 UDS 默认直连`。
+   - **长连接与会话保护**：权重调整**仅影响新建会话/流**；已建立的 HTTP/2 / XHTTP 长连接以及 `AffinityTable` 中尚未过期的 `/split/<session_id>` 会话继续保留在原节点直至自然结束。
+   - **健康检查防黑洞（Fail-Safe）**：当人工指定权重的目标 Peer 在 Gossip 中变为 `Down` 时，自动跳过失效 Peer 并回退至其余健康 Peer 或本机 UDS，避免人工调权误造黑洞；若设置 `--ttl`（默认建议 `30m`），到期后自动清除覆写并恢复自动水位模式。
+   - **重启/重载边界**：除首次部署外，后续配置更新统一采用 `fluxgate reload`（`ArcSwap` 热加载）而非 `restart`，且 `reload` 默认保留尚未过期的 `ManualWeightPolicy` 直至显式 `reset` 或 `TTL` 到期。
+3. **与 HAProxy 异构节点及控制台页面联动**
+   - 统一接入 `console.svc.plus/panel/ops/traffic-dispatch`（手动流量调度页）：运维可在同一界面观测节点引擎类型（`HAProxy` / `Fluxgate`）、活跃连接数（`scur` / `local_active_streams`），并按一致的 `80/20 -> 50/50 -> 20/80 -> 0/100` 节奏对 HAProxy 节点与 Fluxgate 蜂群节点执行排空、升级或慢节点应急切流。
+
+#### 2.5.3 CLI 子命令增强
 
 在 [src/cli.rs](file:///Users/shenlan/workspaces/fluxgate/src/cli.rs) 新增 `fluxgate swarm` 子命令集：
-- `fluxgate swarm status`：输出本机负载分、水位状态、GTM Coordinator 身份、各节点当前 DNS 权重/灰度比例及蜂群成员表（各 Peer 的 `state`、`load_score`、`active_streams`、`rtt_ms`、`spillover_ratio`）。
-- `fluxgate swarm drain` / `fluxgate swarm resume`：通过本地控制接口或信号将本节点置为 `Draining`（触发 GTM Coordinator 立即将该节点 DNS 权重置 0 / 摘除 A 记录，同时 L7 平滑排空流量）或恢复为 `Alive`。
+- `fluxgate swarm status`：输出本机负载分、水位状态、人工权重覆写状态（含剩余 TTL）、GTM Coordinator 身份、各节点当前 DNS 权重/灰度比例及蜂群成员表（各 Peer 的 `state`、`load_score`、`active_streams`、`rtt_ms`、`spillover_ratio`）。
+- `fluxgate swarm weight set <local=W> <peer=W> [--ttl <duration>]` / `fluxgate swarm weight show` / `fluxgate swarm weight reset`：通过 `/run/fluxgate/admin.sock` 实时调整、查看或重置本机与对等节点的 L7 调度权重（零 `reload`、不断存量长连接）。
+- `fluxgate swarm drain` / `fluxgate swarm resume`：通过本地控制接口将本节点置为 `Draining`（等价于 `local=0` 并将流量按健康度分给同群 Peer，同时触发 GTM Coordinator 将该节点 DNS 权重置 0 / 摘除 A 记录）或恢复为 `Alive`。
 
 ---
 
@@ -452,6 +493,7 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
 | `src/swarm/score.rs` | 新增 | `LocalLoadEstimator`：聚合 `active_connections`、`/proc/self/statm` RSS、EWMA 延迟与本地 UDS 错误计数，每秒更新 `AtomicU8` `load_score`。 |
 | `src/swarm/affinity.rs` | 新增 | 64 分片固定大小 `AffinityTable`（`< 256 KiB`），支持 URI `path_segment` 零拷贝提取与 SipHash 会话粘滞绑定。 |
 | `src/swarm/gossip.rs` | 新增 | 实现 Pingora `BackgroundService`：定时执行 H2 `/_fluxgate/swarm/heartbeat` 并发探测、Gossip 成员合并、DNS SRV/A 记录发现与超时节点隔离。 |
+| `src/swarm/admin_sock.rs` | 新增 | 实现本地 `/run/fluxgate/admin.sock` Unix Domain Socket 控制面（`set weight` / `reset weight` / `show stat` / `drain` / `resume`），通过 `ArcSwap<Option<ManualWeightPolicy>>` 支持零 `reload` 实时权重热调度与可选 TTL 自动过期恢复。 |
 | `src/swarm/gtm.rs` | 新增 | 实现 ExternalDNS 自动注册与 GTM Coordinator `BackgroundService`：节点启动自动探测公网 IP 并 `upsert` 自身单机域名与发现记录（带 `_fluxgate-owner` TXT 所有权保护）；通过 Vault KV v2 CAS 选主驱动统一入口域名的动态健康池与灰度权重幂等对账。 |
 | [src/acme/dns.rs](file:///Users/shenlan/workspaces/fluxgate/src/acme/dns.rs) | 扩展 | 抽象通用 `DnsRecordProvider` Trait，内置 `cloudflare`、`alidns`、`route53`、`dnspod` 四大主流规范 DNS 驱动，支持 `A`/`AAAA`/`SRV`/`TXT` 自动 `insert`/`upsert`/`delete`、所有权标记与权重 SLB 更新。 |
 | `src/swarm/auth.rs` | 新增 | 基于 `hmac` + `sha2` 实现心跳与跨机溢出请求头 `X-Fluxgate-Swarm-Sig` 签名与时间窗校验。 |
@@ -469,12 +511,12 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
   - 完成 `src/swarm/auth.rs` HMAC 签名校验与 `X-Fluxgate-Swarm-Hop` 1-Hop 防环路拦截。
 - **验收标准**：`cargo test` 覆盖所有水位边界、滞回防抖与非法签名/环路拒绝场景；未配置 `swarm` 时行为与 `v0.2.1` 100% 一致。
 
-### M2：对等心跳 Gossip 自发现与动态扩缩容
+### M2：对等心跳 Gossip 自发现、本地 `admin.sock` 热调权与动态扩缩容
 - **交付内容**：
   - 完成 `/_fluxgate/swarm/heartbeat` 端点与 `SwarmGossipService` (`BackgroundService`)；
   - 支持种子节点 Gossip 成员自动扩散、DNS 发现与 `Draining` 优雅排空状态广播；
-  - 完成 `fluxgate swarm status` / `drain` CLI。
-- **验收标准**：本地启动 2 个 Fluxgate 实例（模拟 `jp-xconnect-plus-01`、`02`），随后动态启动第 3 个实例（`03`）仅指向 `01`，验证 `2s` 内 `01`、`02`、`03` 三方成员表自动收敛一致；停止 `03` 后 `6s` 内自动摘除。
+  - 完成 `src/swarm/admin_sock.rs`（`/run/fluxgate/admin.sock` 支持 `set weight`、`reset weight`、`show stat` 与 `TTL` 过期自动回退）及 `fluxgate swarm status` / `weight` / `drain` / `resume` CLI。
+- **验收标准**：本地启动 2 个 Fluxgate 实例（模拟 `jp-xconnect-plus-01`、`02`），随后动态启动第 3 个实例（`03`）仅指向 `01`，验证 `2s` 内 `01`、`02`、`03` 三方成员表自动收敛一致；通过 `admin.sock` 执行 `local=80/02=20 -> local=0/02=100` 验证零 `reload`、存量长连接不断、新建连接按权重切流且 `show stat` 准确反映 `scur` 归零；停止 `03` 后 `6s` 内自动摘除。
 
 ### M3：XHTTP 会话粘滞、Bounded-Load P2C 选路与本机故障 Failover
 - **交付内容**：
