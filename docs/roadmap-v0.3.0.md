@@ -27,33 +27,45 @@
 3. **自由弹性扩缩容（Dynamic Peer Join / Leave）**
    - 新节点（如 `jp-xconnect-plus-03.svc.plus`）只需声明相同的蜂群分组 ID（`group "jp-plus"`）、同池共享密钥（`{vault.swarm.shared_key}`）及任一种子节点（Seed）或 DNS 发现域名，启动后 **2 秒内即可通过轻量级 Gossip 广播自动并入蜂群**，立刻分担过载节点溢出流量。
    - 节点优雅维护（`fluxgate swarm drain` 或 `SIGTERM`）或意外宕机时，蜂群在毫秒至秒级内自动将其从候选池摘除。
-4. **严守 1 GiB 边缘节点资源红线**
-   - 延续单二进制极简形态：蜂群心跳、Gossip 成员管理、负载评分与会话粘滞表全部运行在现有 Pingora `BackgroundService` 与 Tokio Runtime 内，不引入 Consul / Etcd / Redis 等任何外部组件。
+4. **L3 DNS GTM + L7 蜂群溢出双层协同（Dual-Plane Traffic Scheduling）**
+   - **源头导流（DNS GTM 平面）**：直接复用 `v0.2.0` 的 Vault KV v2 密钥同步引擎（`{vault.dns.cf_api_token}` / `{vault.dns.ali_access_key_id}` + `{vault.dns.ali_access_key_secret}`）与 DNS Provider 底座（[src/acme/dns.rs](file:///Users/shenlan/workspaces/fluxgate/src/acme/dns.rs)），通过 Vault KV CAS 选主由蜂群唯一 Coordinator 节点驱动 **Cloudflare DNS / Cloudflare Load Balancing** 或 **阿里云智能云解析（AliDNS 权重 SLB + 智能地域/运营商线路）**，实现过载/故障节点源头摘除与**付费用户专属的百分比灰度发布（Canary Weight）**。
+   - **毫秒兜底（L7 Pingora 蜂群溢出平面）**：在客户端 DNS 缓存（TTL）尚未过期的窗口期或瞬时脉冲洪峰下，由 L7 蜂群 1-Hop H2 连接池实现毫秒级无感兜底。
+5. **严守 1 GiB 边缘节点资源红线**
+   - 延续单二进制极简形态：蜂群心跳、Gossip 成员管理、DNS GTM 协调器、负载评分与会话粘滞表全部运行在现有 Pingora `BackgroundService` 与 Tokio Runtime 内，不引入 Consul / Etcd / Redis 等任何外部组件。
    - **内存预算**：蜂群控制面与固定容量分片会话粘滞表（`AffinityTable`）新增常驻内存严格控制在 **`< 2 MiB`**；请求热路径全面采用 `ArcSwap` 与原子指令，零全局互斥锁阻塞。
 
-### 1.2 总体架构
+### 1.2 总体架构（L3 DNS GTM + L7 蜂群双层协同）
 
 ```
-                  客户端流量 (XConnect / VLESS-XHTTP / H2)
-                     │                               │
-       ┌─────────────▼─────────────┐   ┌─────────────▼─────────────┐
-       │ jp-xconnect-plus-01       │   │ jp-xconnect-plus-02       │
-       │ Fluxgate v0.3 (Load: 88%) │   │ Fluxgate v0.3 (Load: 25%) │
-       ├───────────────────────────┤   ├───────────────────────────┤
-       │ 1. 水位 <=75%: 本机 UDS    │   │ 接收直连 + 01 溢出流量     │
-       │    /dev/shm/xray.sock     │   │ (X-Fluxgate-Swarm-Hop: 1  │
-       │ 2. 水位 >75%: 新会话粘滞   │   │  强制本机 UDS 落地，防环)  │
-       │    P2C 选路 ──────────────┼───► /dev/shm/xray.sock        │
-       └─────────────▲─────────────┘   └─────────────▲─────────────┘
-                     │  /_fluxgate/swarm/heartbeat   │
-                     │  (H2 2s 轻量级指标与成员 Gossip)│
-                     └───────────────┬───────────────┘
-                                     ▼
-                     ┌───────────────────────────────┐
-                     │ jp-xconnect-plus-03 ... -0N   │
-                     │ (配置同一 group & seed 即可   │
-                     │  随时自由加入/退出蜂群)        │
-                     └───────────────────────────────┘
+        Vault KV v2 (kv/data/prod/fluxgate/dns-tokens & gtm-policy)
+                     │  1. {vault.dns.cf_api_token} / {vault.dns.ali_*} (Zeroize 内存驻留)
+                     │  2. KV v2 CAS 乐观锁选主 (全群唯一 GTM Coordinator 避免 API 冲突)
+                     ▼
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │ L3 入口调度层: Cloudflare DNS / Paid LB  或  阿里云智能 DNS (AliDNS) │
+   │  - 基础池: 动态增删 jp-xconnect-plus.svc.plus 健康未过载 A/AAAA 记录  │
+   │  - 进阶/付费池: 按负载反比动态调节权重 + 灰度金丝雀比例 + 智能线路   │
+   └─────────────────┬─────────────────────────────────┬─────────────────┘
+                     │ 客户端解析导流 (秒~分钟级收敛)     │
+                     ▼                                 ▼
+       ┌───────────────────────────┐     ┌───────────────────────────┐
+       │ jp-xconnect-plus-01       │     │ jp-xconnect-plus-02       │
+       │ Fluxgate v0.3 (Load: 88%) │     │ Fluxgate v0.3 (Load: 25%) │
+       ├───────────────────────────┤     ├───────────────────────────┤
+       │ 1. 水位 <=70%: 本机 UDS    │     │ 接收直连 + 01 溢出流量     │
+       │    /dev/shm/xray.sock     │     │ (X-Fluxgate-Swarm-Hop: 1  │
+       │ 2. 水位 >70% (DNS TTL 窗):│     │  强制本机 UDS 落地，防环)  │
+       │    L7 P2C 毫秒级溢出 ─────┼────►│  /dev/shm/xray.sock       │
+       └─────────────▲─────────────┘     └─────────────▲─────────────┘
+                     │  /_fluxgate/swarm/heartbeat     │
+                     │  (H2 2s 轻量级指标与成员 Gossip)  │
+                     └────────────────┬────────────────┘
+                                      ▼
+                     ┌─────────────────────────────────┐
+                     │ jp-xconnect-plus-03 ... -0N     │
+                     │ (自动加入 Gossip 并自动注册至    │
+                     │  DNS GTM 池，支持 5%->100% 灰度) │
+                     └─────────────────────────────────┘
 ```
 
 ---
@@ -64,22 +76,35 @@
 
 **目标**：在不破坏 Caddyfile 声明式体验的前提下，让同区域多节点（`jp-xconnect-plus-01`、`jp-xconnect-plus-02` 及后续新节点）使用统一的配置模板即可组成自治蜂群。
 
-#### 2.1.1 DSL 声明规范
+#### 2.1.1 模块化 Drop-in DSL 声明规范（`/etc/fluxgate/conf.d/Swarm-Grouping-Mode.conf`）
 
-在全局块 `{ ... }` 新增 `swarm { ... }` 配置块，并在站点 `reverse_proxy` 块内新增 `swarm_spillover { ... }` 策略：
+利用 Fluxgate 现有的 `import /etc/fluxgate/conf.d/*.conf` 递归解析能力（[src/config/parser.rs](file:///Users/shenlan/workspaces/fluxgate/src/config/parser.rs)），`v0.3.0` 支持**跨文件全局块合并（Multi-File Global Block Merging）**以及**顶层 `swarm { ... }` 块直接声明**：
+- 主配置 `/etc/fluxgate/Fluxgatefile` 保持原有极简结构不变；
+- 蜂群分组与 DNS GTM 策略作为独立功能插件放入 **`/etc/fluxgate/conf.d/Swarm-Grouping-Mode.conf`**（启用时投递该文件并 `fluxgate reload`，停用时删除该文件并 `fluxgate reload`，与 `xconnect-gateway` vhost drop-in 模式完全一致）。
 
+**文件 1：主配置 `/etc/fluxgate/Fluxgatefile`（保持不变）**
 ```caddy
 {
     grace_period 15s
     metrics 127.0.0.1:9102
+}
 
+import /etc/fluxgate/conf.d/*.conf
+```
+
+**文件 2：蜂群分组独立配置 `/etc/fluxgate/conf.d/Swarm-Grouping-Mode.conf`**
+（同时兼容外层包裹 `{ ... }` 全局块或直接顶层声明 `swarm { ... }`；多文件中的 `vault.sync` 条目自动增量合并）：
+```caddy
+# /etc/fluxgate/conf.d/Swarm-Grouping-Mode.conf
+{
     vault {
         addr env(VAULT_ADDR)
         auth approle
         sync swarm kv/data/prod/fluxgate/swarm 5m
+        sync dns   kv/data/prod/fluxgate/dns-tokens 5m
     }
 
-    # Fluxgate v0.3 蜂群分组全局配置
+    # Fluxgate v0.3 蜂群分组配置（也可省略外层 { } 直接在顶层写 swarm { ... }）
     swarm {
         group               "jp-plus"
         region              "jpn-tky"
@@ -98,9 +123,27 @@
         max_active_streams  256                                 # 单机最佳并发活跃流参考基线
         max_memory_mb       350                                 # 单机进程 RSS 内存安全水位基线 (MiB)
         hysteresis          15                                  # 目标 Peer 负载分必须比本机低 15 分以上才触发转移
+
+        # L3 DNS 轻量级 GTM 调度与灰度切流（通过 Vault KV 加载 Cloudflare / 阿里云 DNS API Key）
+        gtm {
+            enabled             true
+            entrypoint          "jp-xconnect-plus.svc.plus"     # 蜂群统一接入域名
+            provider            cloudflare {vault.dns.cf_api_token}
+            # 或使用阿里云智能云解析 (支持权重 SLB 与分地域/运营商智能线路):
+            # provider          alidns {vault.dns.ali_access_key_id} {vault.dns.ali_access_key_secret}
+            mode                weighted_canary                 # multi_a | weighted_canary | cloudflare_lb
+            reconcile_interval  15s                             # GTM Coordinator 巡检对账周期
+            ttl                 60                              # DNS 记录 TTL (秒)
+            min_healthy_nodes   1                               # 保底最少保留 A 记录数，严禁清空全部解析
+            lock_storage        vault kv/data/prod/fluxgate/gtm-locks
+            canary_policy       vault kv/data/prod/fluxgate/gtm-canary   # 可选：动态加载各节点灰度权重
+        }
     }
 }
+```
 
+**文件 3：站点路由配置 `/etc/fluxgate/conf.d/jp-xconnect.conf`**
+```caddy
 jp-xconnect-plus-01.svc.plus jp-xconnect-plus-02.svc.plus jp-xconnect-plus.svc.plus {
     tls /etc/fluxgate/tls/agent-proxy.crt /etc/fluxgate/tls/agent-proxy.key
 
@@ -119,7 +162,7 @@ jp-xconnect-plus-01.svc.plus jp-xconnect-plus-02.svc.plus jp-xconnect-plus.svc.p
             transport http {
                 versions h2c 2
             }
-            # 蜂群无感分流策略
+            # 蜂群无感分流策略（当 conf.d/Swarm-Grouping-Mode.conf 存在并启用时生效；未启用时自动忽略）
             swarm_spillover {
                 enabled                 true
                 affinity                path_segment 2          # 提取 /split/<session_id> 第 2 段做会话粘滞
@@ -267,11 +310,73 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
 
 ---
 
-### 特性 4：可观测性、CLI 诊断与 GitOps 联动
+### 特性 4：基于 Vault KV + Cloudflare / 阿里云智能 DNS 的轻量级 GTM 流量调度与付费高级灰度切流
 
-#### 2.4.1 Prometheus 监控指标（`/metrics`）
+**目标**：将 L3 DNS 入口级全局流量管理（GTM）下沉至 Fluxgate 蜂群内部，直接复用 `v0.2.0` 的 Vault KV v2 密钥加载引擎与 [src/acme/dns.rs](file:///Users/shenlan/workspaces/fluxgate/src/acme/dns.rs) 中的 `CloudflareDnsProvider` / `AliDnsProvider`，实现**零外部 GTM 硬件/SaaS 依赖的源头流量调度与付费用户灰度发布（Canary Traffic Shifting）**。
 
-在 [src/metrics.rs](file:///Users/shenlan/workspaces/fluxgate/src/metrics.rs) 新增以下蜂群专属指标：
+#### 4.1 为什么采用“DNS GTM + L7 蜂群溢出”双层协同？
+
+| 维度 | L3 DNS GTM 平面（Cloudflare / 阿里云智能 DNS） | L7 Pingora 蜂群溢出平面（Swarm Spillover） |
+| :--- | :--- | :--- |
+| **作用阶段** | 客户端建连前（DNS 解析阶段） | 客户端已建连（HTTP/2 请求路由阶段） |
+| **收敛速度** | `15s ~ 60s`（受客户端与递归 DNS TTL 影响） | **`< 2 ms`（毫秒级即时生效，零 TTL 盲区）** |
+| **核心价值** | **源头治本**：将新建客户端连接直接导向低负载节点或按灰度比例切流，避免过载节点持续承接新 TCP/TLS 握手，节省跨机转发带宽。 | **实时兜底**：吸收 DNS TTL 缓存窗口期内的存量请求、瞬时流量尖峰以及本机 Xray 重启的秒级闪断。 |
+
+#### 4.2 Vault KV v2 凭据加载与 CAS 选主协调（防 API 并发冲突）
+
+1. **API 凭据全内存驻留（Zeroize）**
+   - 通过 `vault { sync dns kv/data/prod/fluxgate/dns-tokens 5m }` 动态加载 `{vault.dns.cf_api_token}` 或 `{vault.dns.ali_access_key_id}` / `{vault.dns.ali_access_key_secret}`。
+   - 凭据使用 `Zeroizing<String>` 封装，严格通过 `--strict-gitops` 校验，禁止任何明文 API Key 出现在 `Fluxgatefile` 或 Git 仓库。
+2. **Vault KV CAS 唯一 Coordinator 选主**
+   - 为避免蜂群内 $N$ 台节点同时调用 Cloudflare / 阿里云 DNS API 修改统一入口域名（如 `jp-xconnect-plus.svc.plus`）造成竞态或触发 API Rate Limit，复用 [src/acme/storage.rs](file:///Users/shenlan/workspaces/fluxgate/src/acme/storage.rs) 已验证的 **Vault KV v2 CAS（Check-And-Set）乐观锁租约机制**：
+   - 路径：`kv/data/prod/fluxgate/gtm-locks/<group>`（如 `jp-plus`），租约字段包含 `coordinator_node_id`、`lease_until_unix`（默认 `45s`）、`last_dns_hash`。
+   - **仅持有有效 CAS 租约的唯一 Coordinator 节点**每 `15s` 汇总全蜂群 Gossip 负载表并对比目标 DNS 状态；仅当节点健康集或权重分档发生实质变化时才发起 DNS API 调用（幂等差分更新）。
+   - 若 Coordinator 节点宕机或维护下线，租约到期后其余 `Alive` 节点自动通过 CAS 接管 Coordinator 角色。
+
+#### 4.3 三级 GTM 调度与付费高级灰度切流能力
+
+1. **Tier 1：Cloudflare 标准版 — 动态多 A/AAAA 健康池（Zero-Cost Multi-A Pool）**
+   - 适用场景：免费/标准 Cloudflare DNS 区域，低成本实现高可用与过载保护。
+   - 调度逻辑：
+     - 统一入口域名 `jp-xconnect-plus.svc.plus` 同时挂载蜂群内所有状态为 `Alive` 且 $S_i < \text{high\_watermark}$ 的节点公网 IP（`proxied = false`，`ttl = 60`），同时保留各节点独立域名（`jp-xconnect-plus-01.svc.plus`、`jp-xconnect-plus-02.svc.plus`）不变。
+     - 当 `01` 节点过载（$S_1 \ge 85$）、进入 `Draining` 或宕机时，Coordinator 自动调用 Cloudflare API `DELETE /zones/:zone_id/dns_records/:record_id` 将 `01` 的 IP 从统一入口 `jp-xconnect-plus.svc.plus` 临时摘除，新客户端解析 100% 落入 `02` 及其他健康节点；
+     - 当 `01` 负载回落至 $S_1 \le \text{low\_watermark}$（`70`）并稳定保持 2 个周期后，自动重新挂载回统一入口池。
+     - **保底安全阀（`min_healthy_nodes = 1`）**：若全群所有节点均超过 `high_watermark`，保留负载相对最低的节点记录，**绝不清空域名的全部 A 记录**。
+2. **Tier 2：阿里云智能云解析（AliDNS）— 动态权重 SLB + 灰度切流 + 智能地域/运营商线路**
+   - 适用场景：国内/亚太跨境高质量接入、付费团队池（Plus / Pro / Team）精细化灰度发布与智能线路调度。
+   - 调度逻辑（扩展 [src/acme/dns.rs](file:///Users/shenlan/workspaces/fluxgate/src/acme/dns.rs) 中的 `AliDnsProvider`）：
+     - **开启权重负载均衡**：调用阿里云 OpenAPI `SetDNSSLBStatus` 开启 `jp-xconnect-plus.svc.plus` 子域名权重路由；
+     - **基于实时负载与灰度比例的动态权重计算**：
+       每个健康节点 $i$ 的目标 DNS 权重 $W_i \in [1, 100]$ 由**实时空闲容量**与**灰度系数 $\gamma_i \in [0.0, 1.0]$** 共同决定：
+       $$W_i = \max\left(1,\; \text{round}\left((100 - S_i) \times \gamma_i\right)\right)$$
+     - **付费用户高级流量灰度切换（Canary Rollout）**：
+       运维或控制面可在 Vault KV `kv/data/prod/fluxgate/gtm-canary/jp-plus` 中动态写入灰度策略（无需重启 Fluxgate，由 `VaultSyncService` 热同步）：
+       ```json
+       {
+         "canary_weights": {
+           "jp-xconnect-plus-01.svc.plus": 1.0,
+           "jp-xconnect-plus-02.svc.plus": 1.0,
+           "jp-xconnect-plus-03.svc.plus": 0.10
+         },
+         "lines": {
+           "jp-xconnect-plus-01.svc.plus": "default",
+           "jp-xconnect-plus-02.svc.plus": "overseas"
+         }
+       }
+       ```
+       新节点 `jp-xconnect-plus-03` 上线初期可先分配 `10%`（`0.10`）灰度权重观察稳定性，验证无误后通过修改 Vault KV 渐进调升至 `50% -> 100%`；若异常则一键置为 `0.0` 秒级切走。
+     - **分线路智能解析（Geo / ISP Line Routing）**：支持按阿里云解析线路（`default`、`telecom`、`unicom`、`mobile`、`overseas`）绑定最优节点。
+3. **Tier 3：Cloudflare Paid Load Balancing — 动态 Steering 权重池与地理位置路由**
+   - 适用场景：已开通 Cloudflare Load Balancing 付费订阅的高级租户/专有池。
+   - 调度逻辑：通过 Cloudflare Load Balancer Pools API（`PATCH /accounts/:account_id/load_balancers/pools/:pool_id`）实时更新各 Origin（`jp-xconnect-plus-01`, `02`, `03`）的 `weight`（`0.00 ~ 1.00`）与 `enabled` 状态，配合 Cloudflare `dynamic_latency` 或 `random` Steering Policy 实现全球/区域级精确百分比灰度与自动容灾。
+
+---
+
+### 特性 5：可观测性、CLI 诊断与 GitOps 联动
+
+#### 2.5.1 Prometheus 监控指标（`/metrics`）
+
+在 [src/metrics.rs](file:///Users/shenlan/workspaces/fluxgate/src/metrics.rs) 新增以下蜂群与 GTM 专属指标：
 - `fluxgate_swarm_load_score{group="jp-plus",node_id="..."}`（Gauge `0~100`：本机实时综合负载分）
 - `fluxgate_swarm_peers_total{group="jp-plus",state="alive|suspect|draining|down"}`（Gauge：蜂群各状态节点数）
 - `fluxgate_swarm_peer_load_score{group="jp-plus",peer="jp-xconnect-plus-02.svc.plus"}`（Gauge：本机视角下各对等节点的负载分）
@@ -279,12 +384,15 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
 - `fluxgate_swarm_decisions_total{group="jp-plus",decision="local|spillover|failover|forced_local_hop"}`（Counter：选路决策分布）
 - `fluxgate_swarm_spillover_requests_total{group="jp-plus",target_peer="..."}`（Counter：溢出至各 Peer 的请求数）
 - `fluxgate_swarm_spillover_active_streams{group="jp-plus",target_peer="..."}`（Gauge：当前正溢出至各 Peer 的并发流数）
+- `fluxgate_gtm_is_coordinator{group="jp-plus"}`（Gauge `1`/`0`：本节点是否持有当前 GTM Coordinator CAS 锁）
+- `fluxgate_gtm_node_weight{group="jp-plus",entrypoint="jp-xconnect-plus.svc.plus",node="...",provider="cloudflare|alidns"}`（Gauge：当前生效的各节点 DNS GTM 权重/挂载状态）
+- `fluxgate_gtm_reconcile_total{group="jp-plus",provider="cloudflare|alidns",result="updated|noop|error"}`（Counter：DNS GTM 对账结果计数）
 
-#### 2.4.2 CLI 子命令增强
+#### 2.5.2 CLI 子命令增强
 
 在 [src/cli.rs](file:///Users/shenlan/workspaces/fluxgate/src/cli.rs) 新增 `fluxgate swarm` 子命令集：
-- `fluxgate swarm status`：输出本机负载分、水位状态及蜂群成员表（各 Peer 的 `state`、`load_score`、`active_streams`、`rtt_ms`、`spillover_ratio`）。
-- `fluxgate swarm drain` / `fluxgate swarm resume`：通过本地控制接口或信号将本节点置为 `Draining`（平滑排空流量以进行维护）或恢复为 `Alive`。
+- `fluxgate swarm status`：输出本机负载分、水位状态、GTM Coordinator 身份、各节点当前 DNS 权重/灰度比例及蜂群成员表（各 Peer 的 `state`、`load_score`、`active_streams`、`rtt_ms`、`spillover_ratio`）。
+- `fluxgate swarm drain` / `fluxgate swarm resume`：通过本地控制接口或信号将本节点置为 `Draining`（触发 GTM Coordinator 立即将该节点 DNS 权重置 0 / 摘除 A 记录，同时 L7 平滑排空流量）或恢复为 `Alive`。
 
 ---
 
@@ -292,15 +400,17 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
 
 | 模块路径 | 变更类型 | 核心职责与实现设计 |
 | :--- | :---: | :--- |
-| [src/config/ast.rs](file:///Users/shenlan/workspaces/fluxgate/src/config/ast.rs) | 修改 | 1. `GlobalConfig` 新增 `pub swarm: Option<SwarmConfig>`；<br/>2. `ReverseProxyConfig` 新增 `pub swarm_spillover: Option<SwarmSpilloverConfig>`；<br/>3. `UpstreamTarget` 新增 `SwarmPeer { node_id: String, addr: String, sni: String }`。 |
-| [src/config/parser.rs](file:///Users/shenlan/workspaces/fluxgate/src/config/parser.rs) & [validate.rs](file:///Users/shenlan/workspaces/fluxgate/src/config/validate.rs) | 修改 | 解析 `swarm { ... }` 与 `swarm_spillover { ... }`；校验 `low_watermark < high_watermark <= 100`；在 `--strict-gitops` 下强制要求 `shared_key` 使用 `{vault.*}` 或 `env(*)`，拒绝明文密钥。 |
+| [src/config/ast.rs](file:///Users/shenlan/workspaces/fluxgate/src/config/ast.rs) | 修改 | 1. `GlobalConfig` 新增 `pub swarm: Option<SwarmConfig>`（内含 `pub gtm: Option<SwarmGtmConfig>`）；<br/>2. `ReverseProxyConfig` 新增 `pub swarm_spillover: Option<SwarmSpilloverConfig>`；<br/>3. `UpstreamTarget` 新增 `SwarmPeer { node_id: String, addr: String, sni: String }`。 |
+| [src/config/parser.rs](file:///Users/shenlan/workspaces/fluxgate/src/config/parser.rs) & [validate.rs](file:///Users/shenlan/workspaces/fluxgate/src/config/validate.rs) | 修改 | 支持从 `/etc/fluxgate/conf.d/Swarm-Grouping-Mode.conf` 等 `import` 子文件中增量合并 `{ vault { ... } swarm { ... gtm { ... } } }` 全局块或直接解析顶层 `swarm { ... }`；校验水位关系与 `min_healthy_nodes >= 1`；在 `--strict-gitops` 下强制要求 `shared_key` 与 GTM DNS API 凭据使用 `{vault.*}` 或 `env(*)`。 |
 | `src/swarm/mod.rs` | 新增 | `SwarmManager` 核心门面：整合 `LocalLoadEstimator`、`PeerTable`（`ArcSwap` 快照）、`AffinityTable` 与 P2C 选路器 `select_upstream()`。 |
 | `src/swarm/score.rs` | 新增 | `LocalLoadEstimator`：聚合 `active_connections`、`/proc/self/statm` RSS、EWMA 延迟与本地 UDS 错误计数，每秒更新 `AtomicU8` `load_score`。 |
 | `src/swarm/affinity.rs` | 新增 | 64 分片固定大小 `AffinityTable`（`< 256 KiB`），支持 URI `path_segment` 零拷贝提取与 SipHash 会话粘滞绑定。 |
 | `src/swarm/gossip.rs` | 新增 | 实现 Pingora `BackgroundService`：定时执行 H2 `/_fluxgate/swarm/heartbeat` 并发探测、Gossip 成员合并、DNS SRV/A 记录发现与超时节点隔离。 |
-| `src/swarm/auth.rs` | 新增 | 基于 `hmac` + `sha2`（或 OpenSSL HMAC）实现心跳与跨机溢出请求头 `X-Fluxgate-Swarm-Sig` 签名与时间窗校验。 |
+| `src/swarm/gtm.rs` | 新增 | 实现 GTM Coordinator `BackgroundService`：通过 Vault KV v2 CAS 选主，读取 Vault 动态灰度策略（`canary_policy`），驱动 Cloudflare（Multi-A / Paid LB Pools）与阿里云智能 DNS（`SetDNSSLBStatus` / `UpdateDNSSLBWeight` / 分线路 A 记录）幂等对账。 |
+| [src/acme/dns.rs](file:///Users/shenlan/workspaces/fluxgate/src/acme/dns.rs) | 扩展 | 在现有 `CloudflareDnsProvider` 与 `AliDnsProvider` 上扩展 `A`/`AAAA` 记录增删改查、AliDNS 权重 SLB API（`UpdateDNSSLBWeight`）及 Cloudflare Load Balancer Pool 权重更新接口。 |
+| `src/swarm/auth.rs` | 新增 | 基于 `hmac` + `sha2` 实现心跳与跨机溢出请求头 `X-Fluxgate-Swarm-Sig` 签名与时间窗校验。 |
 | [src/proxy/service.rs](file:///Users/shenlan/workspaces/fluxgate/src/proxy/service.rs) | 修改 | 1. `request_filter()` 拦截 `/_fluxgate/swarm/heartbeat`；<br/>2. 识别 `X-Fluxgate-Swarm-Hop` 强制本地落地（1-Hop 防环）；<br/>3. 调用 `SwarmManager::select_upstream()` 决定走本机 UDS 或溢出至 Peer；<br/>4. `upstream_peer()` 为 `SwarmPeer` 构建 TLS + H2 多路复用 `HttpPeer`。 |
-| [src/metrics.rs](file:///Users/shenlan/workspaces/fluxgate/src/metrics.rs) | 修改 | 扩展 `MetricsRegistry` 输出 `fluxgate_swarm_*` 系列 Prometheus 指标。 |
+| [src/metrics.rs](file:///Users/shenlan/workspaces/fluxgate/src/metrics.rs) | 修改 | 扩展 `MetricsRegistry` 输出 `fluxgate_swarm_*` 与 `fluxgate_gtm_*` 系列 Prometheus 指标。 |
 
 ---
 
@@ -308,7 +418,7 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
 
 ### M1：蜂群 DSL、多维负载分引擎与 1-Hop 防环路底座
 - **交付内容**：
-  - 完成 `swarm {}` 与 `swarm_spillover {}` AST、Parser 及 `--strict-gitops` 校验单元测试；
+  - 完成 `swarm { ... gtm { ... } }` 与 `swarm_spillover {}` AST、Parser 及 `--strict-gitops` 校验单元测试；
   - 完成 `src/swarm/score.rs` 多维负载分计算与三段式水位状态机；
   - 完成 `src/swarm/auth.rs` HMAC 签名校验与 `X-Fluxgate-Swarm-Hop` 1-Hop 防环路拦截。
 - **验收标准**：`cargo test` 覆盖所有水位边界、滞回防抖与非法签名/环路拒绝场景；未配置 `swarm` 时行为与 `v0.2.1` 100% 一致。
@@ -329,11 +439,19 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
   - 模拟同一 `/split/<session_id>` 的并发 `POST` 与 `GET` 流，验证 100% 粘滞到同一目标节点；
   - 模拟单节点负载分升至 `90` 或断开本机 UDS，验证流量无损切往健康 Peer，且跨机请求数绝不发生二次转发（Hop 恒为 1）。
 
-### M4：Ansible Pull / GitOps 集成与东京 Plus 蜂群 500-VU K6 压测验收
+### M4：Vault KV + Cloudflare / 阿里云智能 DNS 轻量级 GTM 与灰度切流
 - **交付内容**：
-  - 更新 `ai-workspace-infra/playbooks/roles/vhosts/fluxgate` 模板支持 `fluxgate_swarm_enabled` 及蜂群参数渲染；
-  - 在 `jp-xconnect-plus-01.svc.plus` 与 `jp-xconnect-plus-02.svc.plus` 上线 `jp-plus` 蜂群分组；
-  - 补充 Grafana 蜂群拓扑与溢出流量面板。
+  - 扩展 [src/acme/dns.rs](file:///Users/shenlan/workspaces/fluxgate/src/acme/dns.rs) 支持 Cloudflare A/AAAA 动态池 & Paid LB Pool Weight API，以及阿里云 AliDNS 权重 SLB（`SetDNSSLBStatus` / `UpdateDNSSLBWeight`）与分线路解析 API；
+  - 完成 `src/swarm/gtm.rs`：基于 Vault KV v2 CAS 选主、动态灰度权重（`canary_policy`）加载、过载节点自动摘除与 `min_healthy_nodes` 保底保护。
 - **验收标准**：
-  - 单点向 `jp-xconnect-plus-01.svc.plus` 打入 `500 VUs` K6 极限压测流量，当 `01` 达到高水位后，超额会话自动无感溢出至 `jp-xconnect-plus-02.svc.plus`；
+  - 基于 Mock Cloudflare / AliDNS + Vault KV 测试验证：多节点并发运行时仅唯一 CAS Coordinator 发起 DNS 更新；
+  - 当模拟 `01` 过载或 `drain` 时，Coordinator 自动将其 DNS 权重调降/摘除；修改 Vault KV 灰度配置（如 `03` 权重 `10% -> 50%`）后 `15s` 内自动同步至 Cloudflare / 阿里云 DNS。
+
+### M5：Ansible Pull / GitOps 集成与东京 Plus 蜂群 500-VU K6 压测验收
+- **交付内容**：
+  - 更新 `ai-workspace-infra/playbooks/roles/vhosts/fluxgate` 模板支持 `fluxgate_swarm_enabled`、`fluxgate_gtm_enabled` 及蜂群参数渲染；
+  - 在 `jp-xconnect-plus-01.svc.plus` 与 `jp-xconnect-plus-02.svc.plus` 上线 `jp-plus` 蜂群分组与 `jp-xconnect-plus.svc.plus` GTM 调度；
+  - 补充 Grafana 蜂群拓扑、DNS GTM 权重与 L7 溢出流量面板。
+- **验收标准**：
+  - 单点向 `jp-xconnect-plus-01.svc.plus` 打入 `500 VUs` K6 极限压测流量，当 `01` 达到高水位后，L7 超额会话即时无感溢出至 `jp-xconnect-plus-02.svc.plus`，同时 L3 GTM 自动调整 `jp-xconnect-plus.svc.plus` 权重将后续新建客户端导向 `02`；
   - 压测全程可用性 **`100.00%`**，单机 `Fluxgate` 内存增幅 `< 10 MiB`（控制面开销 `< 2 MiB`），客户端零感知断流。
