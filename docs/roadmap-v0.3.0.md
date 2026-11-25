@@ -124,13 +124,28 @@ import /etc/fluxgate/conf.d/*.conf
         max_memory_mb       350                                 # 单机进程 RSS 内存安全水位基线 (MiB)
         hysteresis          15                                  # 目标 Peer 负载分必须比本机低 15 分以上才触发转移
 
-        # L3 DNS 轻量级 GTM 调度与灰度切流（通过 Vault KV 加载 Cloudflare / 阿里云 DNS API Key）
+        # L3 DNS 轻量级 GTM 调度、ExternalDNS 免手动自动注册与灰度切流
         gtm {
             enabled             true
             entrypoint          "jp-xconnect-plus.svc.plus"     # 蜂群统一接入域名
+            # 类 ExternalDNS 全程免手动 DNS：节点启动自动探测公网 IP 并自动 insert/update 三类记录
+            # (1) 单机域名: jp-xconnect-plus-01.svc.plus -> 本机公网 IPv4/IPv6
+            # (2) 蜂群发现记录: _fluxgate-swarm._tcp.jp-plus.svc.plus (SRV / 多 A)
+            # (3) 蜂群统一入口: jp-xconnect-plus.svc.plus (多 A / 权重 SLB)
+            auto_register       true                            # 开启 ExternalDNS 风格自动 insert/upsert
+            public_ip           auto                            # auto (网卡公网 IP + STUN/HTTPS 探测) 或显式指定 IP
+            ownership_txt       true                            # 维护 _fluxgate-owner.<fqdn> TXT 所有权签名，防误删非托管记录
+            cleanup_on_drain    true                            # 节点 drain / 下线时自动清理其 GTM 与发现记录
+
+            # 主流规范 DNS 服务商插件化接入 (统一通过 Vault KV 加载 API Key):
             provider            cloudflare {vault.dns.cf_api_token}
-            # 或使用阿里云智能云解析 (支持权重 SLB 与分地域/运营商智能线路):
+            # 阿里云云解析 AliDNS (支持权重 SLB 与分地域/运营商智能线路):
             # provider          alidns {vault.dns.ali_access_key_id} {vault.dns.ali_access_key_secret}
+            # AWS Route 53 (SigV4 签名，支持 Weighted / Latency Routing):
+            # provider          route53 {vault.dns.aws_access_key_id} {vault.dns.aws_secret_access_key} zone_id={vault.dns.aws_zone_id}
+            # 腾讯云 DNSPod (TC3-HMAC-SHA256 签名，支持权重与分线路):
+            # provider          dnspod {vault.dns.dnspod_secret_id} {vault.dns.dnspod_secret_key}
+
             mode                weighted_canary                 # multi_a | weighted_canary | cloudflare_lb
             reconcile_interval  15s                             # GTM Coordinator 巡检对账周期
             ttl                 60                              # DNS 记录 TTL (秒)
@@ -310,19 +325,50 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
 
 ---
 
-### 特性 4：基于 Vault KV + Cloudflare / 阿里云智能 DNS 的轻量级 GTM 流量调度与付费高级灰度切流
+### 特性 4：类 ExternalDNS 全程免手动 DNS 自动注册 + 轻量级 GTM 流量调度与灰度切流
 
-**目标**：将 L3 DNS 入口级全局流量管理（GTM）下沉至 Fluxgate 蜂群内部，直接复用 `v0.2.0` 的 Vault KV v2 密钥加载引擎与 [src/acme/dns.rs](file:///Users/shenlan/workspaces/fluxgate/src/acme/dns.rs) 中的 `CloudflareDnsProvider` / `AliDnsProvider`，实现**零外部 GTM 硬件/SaaS 依赖的源头流量调度与付费用户灰度发布（Canary Traffic Shifting）**。
+**目标**：借鉴 Kubernetes `external-dns` 的自动化设计理念，在接入主流规范 DNS 服务商 API Key（通过 Vault KV v2 安全注入）的前提下，实现**从新节点开机、单机域名 insert、蜂群发现种子注册，到统一入口域名 GTM 权重调优与下线清理的全生命周期免手动 DNS 运维**。
 
-#### 4.1 为什么采用“DNS GTM + L7 蜂群溢出”双层协同？
+#### 4.1 为什么采用“ExternalDNS 自动注册 + DNS GTM + L7 蜂群溢出”协同？
 
-| 维度 | L3 DNS GTM 平面（Cloudflare / 阿里云智能 DNS） | L7 Pingora 蜂群溢出平面（Swarm Spillover） |
+| 维度 | L3 ExternalDNS 自动注册 & GTM 平面 | L7 Pingora 蜂群溢出平面（Swarm Spillover） |
 | :--- | :--- | :--- |
-| **作用阶段** | 客户端建连前（DNS 解析阶段） | 客户端已建连（HTTP/2 请求路由阶段） |
-| **收敛速度** | `15s ~ 60s`（受客户端与递归 DNS TTL 影响） | **`< 2 ms`（毫秒级即时生效，零 TTL 盲区）** |
-| **核心价值** | **源头治本**：将新建客户端连接直接导向低负载节点或按灰度比例切流，避免过载节点持续承接新 TCP/TLS 握手，节省跨机转发带宽。 | **实时兜底**：吸收 DNS TTL 缓存窗口期内的存量请求、瞬时流量尖峰以及本机 Xray 重启的秒级闪断。 |
+| **运维体验** | **全程免手动改 DNS**：新节点 `jp-xconnect-plus-03` 开机即自动探测公网 IP 并 insert 自身 `A`/`AAAA`、蜂群发现 `SRV`/`A` 及统一入口 `jp-xconnect-plus.svc.plus` 记录。 | **零配置自动建连**：通过 DNS 发现记录或种子 Gossip 2 秒内自动建立 H2 跨机溢出通道。 |
+| **作用阶段** | 客户端建连前（DNS 解析阶段，`15s ~ 60s` 收敛） | 客户端已建连（HTTP/2 请求路由阶段，**`< 2 ms` 即时生效**） |
+| **核心价值** | **源头治本**：免除人工去 Cloudflare/阿里云后台增删改 IP 的繁琐操作；将新建客户端连接直接导向低负载节点或按灰度比例切流。 | **实时兜底**：吸收 DNS TTL 缓存窗口期内的存量请求、瞬时流量尖峰以及本机 Xray 重启的秒级闪断。 |
 
-#### 4.2 Vault KV v2 凭据加载与 CAS 选主协调（防 API 并发冲突）
+#### 4.2 类 ExternalDNS 全程免手动 DNS 生命周期管理（Zero-Touch DNS Auto-Insert）
+
+当 `gtm { auto_register true }` 启用且 Vault KV 提供了有效 DNS API Key 时，Fluxgate 自动接管以下三类 DNS 记录的 `insert / upsert / delete` 闭环：
+
+1. **三类自动化 DNS 记录**
+   - **① 单机专属直连记录（Node Self Record）**：
+     - 节点启动时自动检测本机公网 IPv4 / IPv6（优先读取主网卡公网地址，若处于云厂商 1:1 NAT 环境则通过多源 HTTPS/STUN 接口交叉确认公网出口 IP）。
+     - 节点自身自动调用 DNS Provider API 将 `<node_id>`（如 `jp-xconnect-plus-03.svc.plus`）以及本机声明的独立业务站点域名（如 `jp-xconnect-gateway-02.svc.plus`）自动 `insert` 或更新至当前公网 IP（主机更换弹性 IP 重启后自动自愈更新）。
+   - **② 蜂群自发现种子记录（Swarm Discovery Record）**：
+     - 自动将本节点 IP / 端口注册到 `dns_discover` 域名（如 `_fluxgate-swarm._tcp.jp-plus.svc.plus` `SRV` 记录或 `swarm-jp-plus.svc.plus` 多 `A` 记录）。
+     - **彻底告别静态 `seeds` 维护**：哪怕配置文件中一行 `seeds` 都不写，任何新节点只要配置了相同的 `group "jp-plus"` 与 DNS Provider，开机查询 `dns_discover` 域名即可发现存量蜂群并自动加入。
+   - **③ 蜂群统一入口 GTM 记录（Pool Entrypoint Record）**：
+     - 由持有 Vault CAS 锁的 GTM Coordinator 根据全群健康状态、实时负载分 $S_i$ 与灰度权重 $\gamma_i$，自动向统一入口域名（如 `jp-xconnect-plus.svc.plus`）批量 `insert` 新加入的健康节点记录、更新权重或摘除过载/下线节点。
+2. **ExternalDNS 风格 TXT 所有权注册表（Ownership Registry — 严防误删非托管记录）**
+   - 完全对齐 Kubernetes `external-dns` 安全规范：Fluxgate 自动 `insert` 任何 DNS 记录时，同步写入伴生 TXT 所有权签名记录 `_fluxgate-owner.<fqdn>`（以及云厂商原生 Record `comment` / `remark` 字段）：
+     ```text
+     "heritage=fluxgate,fluxgate/group=jp-plus,fluxgate/owner=jp-xconnect-plus-03.svc.plus,fluxgate/resource=gtm"
+     ```
+   - **安全铁律**：Fluxgate 的 Reconciler **仅允许修改或删除带有 `heritage=fluxgate` 且 `fluxgate/group` 匹配的记录**；对于运维人员手工在控制台创建的非托管记录（或无所有权 TXT 的存量记录，除非开启 `adopt_existing true`），只读不删，确保生产域名绝对安全。
+
+#### 4.3 主流规范 DNS 服务商插件化矩阵（`DnsRecordProvider` 标准接口）
+
+将 `v0.2.0` 原有仅面向 ACME `_acme-challenge` TXT 记录的 `DnsProvider` 抽象升级为完整的 **`DnsRecordProvider` 标准接口**（统一封装 `list_records`、`upsert_record`、`delete_record`、`update_weight`），所有凭据均通过 `{vault.dns.*}` 内存注入：
+
+| DNS 服务商 (`provider`) | 认证方式（Vault KV 引用） | 核心支持能力与规范 API |
+| :--- | :--- | :--- |
+| **`cloudflare`** | `{vault.dns.cf_api_token}`（Bearer Token，Zone DNS Edit 权限） | Cloudflare API v4 `/zones/:id/dns_records`（自动 `insert`/`PATCH`/`DELETE` `A`/`AAAA`/`SRV`/`TXT` 及 `comment` 所有权标记）+ 付费版 Load Balancer Pools API。 |
+| **`alidns`**（阿里云智能 DNS） | `{vault.dns.ali_access_key_id}` + `{vault.dns.ali_access_key_secret}` | 阿里云 OpenAPI v2/v3（`AddDomainRecord` / `UpdateDomainRecord` / `SetDNSSLBStatus` / `UpdateDNSSLBWeight` / `UpdateDomainRecordRemark`），原生支持 `1~100` 权重 SLB 与分运营商/分地域智能线路（`default` / `overseas` / `telecom` / `unicom` / `mobile`）。 |
+| **`route53`**（AWS Route 53） | `{vault.dns.aws_access_key_id}` + `{vault.dns.aws_secret_access_key}` | 纯 Rust AWS SigV4 签名调用 `ChangeResourceRecordSets`（`UPSERT` / `DELETE`），原生支持 `SetIdentifier` + `Weight`（`0~255` 加权路由）与 `Region` 延迟路由。 |
+| **`dnspod`**（腾讯云 DNSPod） | `{vault.dns.dnspod_secret_id}` + `{vault.dns.dnspod_secret_key}` | 腾讯云 API v3 `TC3-HMAC-SHA256` 签名（`CreateRecord` / `ModifyRecord` / `DeleteRecord`），支持记录级 `Weight`（`1~100`）与分线路智能解析。 |
+
+#### 4.4 Vault KV v2 凭据加载与 CAS 选主协调（防 API 并发冲突）
 
 1. **API 凭据全内存驻留（Zeroize）**
    - 通过 `vault { sync dns kv/data/prod/fluxgate/dns-tokens 5m }` 动态加载 `{vault.dns.cf_api_token}` 或 `{vault.dns.ali_access_key_id}` / `{vault.dns.ali_access_key_secret}`。
@@ -333,7 +379,7 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
    - **仅持有有效 CAS 租约的唯一 Coordinator 节点**每 `15s` 汇总全蜂群 Gossip 负载表并对比目标 DNS 状态；仅当节点健康集或权重分档发生实质变化时才发起 DNS API 调用（幂等差分更新）。
    - 若 Coordinator 节点宕机或维护下线，租约到期后其余 `Alive` 节点自动通过 CAS 接管 Coordinator 角色。
 
-#### 4.3 三级 GTM 调度与付费高级灰度切流能力
+#### 4.5 三级 GTM 调度与付费高级灰度切流能力
 
 1. **Tier 1：Cloudflare 标准版 — 动态多 A/AAAA 健康池（Zero-Cost Multi-A Pool）**
    - 适用场景：免费/标准 Cloudflare DNS 区域，低成本实现高可用与过载保护。
@@ -406,8 +452,8 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
 | `src/swarm/score.rs` | 新增 | `LocalLoadEstimator`：聚合 `active_connections`、`/proc/self/statm` RSS、EWMA 延迟与本地 UDS 错误计数，每秒更新 `AtomicU8` `load_score`。 |
 | `src/swarm/affinity.rs` | 新增 | 64 分片固定大小 `AffinityTable`（`< 256 KiB`），支持 URI `path_segment` 零拷贝提取与 SipHash 会话粘滞绑定。 |
 | `src/swarm/gossip.rs` | 新增 | 实现 Pingora `BackgroundService`：定时执行 H2 `/_fluxgate/swarm/heartbeat` 并发探测、Gossip 成员合并、DNS SRV/A 记录发现与超时节点隔离。 |
-| `src/swarm/gtm.rs` | 新增 | 实现 GTM Coordinator `BackgroundService`：通过 Vault KV v2 CAS 选主，读取 Vault 动态灰度策略（`canary_policy`），驱动 Cloudflare（Multi-A / Paid LB Pools）与阿里云智能 DNS（`SetDNSSLBStatus` / `UpdateDNSSLBWeight` / 分线路 A 记录）幂等对账。 |
-| [src/acme/dns.rs](file:///Users/shenlan/workspaces/fluxgate/src/acme/dns.rs) | 扩展 | 在现有 `CloudflareDnsProvider` 与 `AliDnsProvider` 上扩展 `A`/`AAAA` 记录增删改查、AliDNS 权重 SLB API（`UpdateDNSSLBWeight`）及 Cloudflare Load Balancer Pool 权重更新接口。 |
+| `src/swarm/gtm.rs` | 新增 | 实现 ExternalDNS 自动注册与 GTM Coordinator `BackgroundService`：节点启动自动探测公网 IP 并 `upsert` 自身单机域名与发现记录（带 `_fluxgate-owner` TXT 所有权保护）；通过 Vault KV v2 CAS 选主驱动统一入口域名的动态健康池与灰度权重幂等对账。 |
+| [src/acme/dns.rs](file:///Users/shenlan/workspaces/fluxgate/src/acme/dns.rs) | 扩展 | 抽象通用 `DnsRecordProvider` Trait，内置 `cloudflare`、`alidns`、`route53`、`dnspod` 四大主流规范 DNS 驱动，支持 `A`/`AAAA`/`SRV`/`TXT` 自动 `insert`/`upsert`/`delete`、所有权标记与权重 SLB 更新。 |
 | `src/swarm/auth.rs` | 新增 | 基于 `hmac` + `sha2` 实现心跳与跨机溢出请求头 `X-Fluxgate-Swarm-Sig` 签名与时间窗校验。 |
 | [src/proxy/service.rs](file:///Users/shenlan/workspaces/fluxgate/src/proxy/service.rs) | 修改 | 1. `request_filter()` 拦截 `/_fluxgate/swarm/heartbeat`；<br/>2. 识别 `X-Fluxgate-Swarm-Hop` 强制本地落地（1-Hop 防环）；<br/>3. 调用 `SwarmManager::select_upstream()` 决定走本机 UDS 或溢出至 Peer；<br/>4. `upstream_peer()` 为 `SwarmPeer` 构建 TLS + H2 多路复用 `HttpPeer`。 |
 | [src/metrics.rs](file:///Users/shenlan/workspaces/fluxgate/src/metrics.rs) | 修改 | 扩展 `MetricsRegistry` 输出 `fluxgate_swarm_*` 与 `fluxgate_gtm_*` 系列 Prometheus 指标。 |
