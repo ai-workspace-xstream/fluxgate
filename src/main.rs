@@ -137,11 +137,9 @@ impl ConfigReloadService {
                 if trigger == "file_watch" && hash == *last_hash {
                     return;
                 }
-                if let Err(e) = sync_static_certs_to_store(
-                    &new_cfg,
-                    &self.cert_store,
-                    self.metrics.as_deref(),
-                ) {
+                if let Err(e) =
+                    sync_static_certs_to_store(&new_cfg, &self.cert_store, self.metrics.as_deref())
+                {
                     tracing::error!(
                         "Hot-reload ({}) aborted (TLS load failure), keeping active config: {}",
                         trigger,

@@ -152,29 +152,25 @@ impl Parser {
                 "http_port" => {
                     let val_tok = cursor.expect_word("http_port number (1..65535)")?;
                     let raw = val_tok.kind_word();
-                    let port = raw
-                        .parse::<u16>()
-                        .ok()
-                        .filter(|&p| p > 0)
-                        .ok_or_else(|| FluxgateError::ConfigSyntax {
+                    let port = raw.parse::<u16>().ok().filter(|&p| p > 0).ok_or_else(|| {
+                        FluxgateError::ConfigSyntax {
                             file: val_tok.file,
                             line: val_tok.line,
                             msg: format!("Invalid http_port '{}'", raw),
-                        })?;
+                        }
+                    })?;
                     global.http_port = port;
                 }
                 "https_port" => {
                     let val_tok = cursor.expect_word("https_port number (1..65535)")?;
                     let raw = val_tok.kind_word();
-                    let port = raw
-                        .parse::<u16>()
-                        .ok()
-                        .filter(|&p| p > 0)
-                        .ok_or_else(|| FluxgateError::ConfigSyntax {
+                    let port = raw.parse::<u16>().ok().filter(|&p| p > 0).ok_or_else(|| {
+                        FluxgateError::ConfigSyntax {
                             file: val_tok.file,
                             line: val_tok.line,
                             msg: format!("Invalid https_port '{}'", raw),
-                        })?;
+                        }
+                    })?;
                     global.https_port = port;
                 }
                 "log" => {
@@ -684,13 +680,13 @@ impl Parser {
                 "max_h2_streams" => {
                     let val_tok = cursor.expect_word("max_h2_streams value")?;
                     let raw = val_tok.kind_word();
-                    transport.max_h2_streams = raw.parse::<usize>().map_err(|_| {
-                        FluxgateError::ConfigSyntax {
-                            file: val_tok.file,
-                            line: val_tok.line,
-                            msg: format!("Invalid max_h2_streams '{}' (expected integer)", raw),
-                        }
-                    })?;
+                    transport.max_h2_streams =
+                        raw.parse::<usize>()
+                            .map_err(|_| FluxgateError::ConfigSyntax {
+                                file: val_tok.file,
+                                line: val_tok.line,
+                                msg: format!("Invalid max_h2_streams '{}' (expected integer)", raw),
+                            })?;
                 }
                 "read_timeout" | "read_timeout_secs" => {
                     let val_tok = cursor.expect_word("read_timeout value")?;
@@ -712,7 +708,11 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_hybrid_proxy(&self, cursor: &mut TokenCursor, open_tok: Token) -> Result<HybridProxyConfig> {
+    fn parse_hybrid_proxy(
+        &self,
+        cursor: &mut TokenCursor,
+        open_tok: Token,
+    ) -> Result<HybridProxyConfig> {
         cursor.expect(TokenKind::OpenBrace, "open brace '{' for hybrid_proxy")?;
         let mut mode = HybridMode::WeightedFailover;
         let mut sticky_key = None;
@@ -754,8 +754,8 @@ impl Parser {
                     }
                 }
                 "sticky_key" => {
-                    let sk_tok = cursor
-                        .expect_word("sticky_key spec (header(<Name>)|client_ip|path)")?;
+                    let sk_tok =
+                        cursor.expect_word("sticky_key spec (header(<Name>)|client_ip|path)")?;
                     sticky_key = Some(parse_sticky_key(&sk_tok)?);
                 }
                 "retry_safe_methods" => {
@@ -899,11 +899,13 @@ impl Parser {
                     "daily_budget" => {
                         let b_tok = cursor.expect_word("daily_budget request count")?;
                         let raw = b_tok.kind_word();
-                        let val = raw.parse::<u64>().map_err(|_| FluxgateError::ConfigSyntax {
-                            file: b_tok.file,
-                            line: b_tok.line,
-                            msg: format!("Invalid daily_budget '{}'", raw),
-                        })?;
+                        let val = raw
+                            .parse::<u64>()
+                            .map_err(|_| FluxgateError::ConfigSyntax {
+                                file: b_tok.file,
+                                line: b_tok.line,
+                                msg: format!("Invalid daily_budget '{}'", raw),
+                            })?;
                         daily_budget = Some(val);
                     }
                     "fallback_on_status" => {
@@ -943,8 +945,7 @@ impl Parser {
                                 ),
                             });
                         };
-                        fallback_on_headers
-                            .push((hk.trim().to_string(), hv.trim().to_string()));
+                        fallback_on_headers.push((hk.trim().to_string(), hv.trim().to_string()));
                     }
                     "header_up" => {
                         let h_name = cursor.expect_word("header_up header name")?.kind_word();
@@ -1359,11 +1360,13 @@ fn parse_upstream_target(
             line: tok.line,
             msg: format!("Invalid upstream URL '{}': {}", upstream_str, e),
         })?;
-        let host = parsed.host_str().ok_or_else(|| FluxgateError::ConfigSyntax {
-            file: tok.file.clone(),
-            line: tok.line,
-            msg: format!("Upstream URL '{}' missing host", upstream_str),
-        })?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| FluxgateError::ConfigSyntax {
+                file: tok.file.clone(),
+                line: tok.line,
+                msg: format!("Upstream URL '{}' missing host", upstream_str),
+            })?;
         if parsed.path() != "/" && !parsed.path().is_empty() {
             return Err(FluxgateError::ConfigSyntax {
                 file: tok.file.clone(),

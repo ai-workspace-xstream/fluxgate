@@ -67,11 +67,7 @@ pub struct HybridSelection<'a> {
 impl CompiledHybridPool {
     pub fn compile(cfg: &HybridProxyConfig) -> Self {
         let retry_safe_methods = if cfg.retry_safe_methods.is_empty() {
-            vec![
-                "GET".to_string(),
-                "HEAD".to_string(),
-                "OPTIONS".to_string(),
-            ]
+            vec!["GET".to_string(), "HEAD".to_string(), "OPTIONS".to_string()]
         } else {
             cfg.retry_safe_methods
                 .iter()
