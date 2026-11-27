@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "fluxgate.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fluxgate.labels" . | nindent 4 }}
+data:
+  Fluxgatefile: |
+    {{- .Values.config.fluxgatefile | nindent 4 }}

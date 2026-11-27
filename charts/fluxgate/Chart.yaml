@@ -1,0 +1,16 @@
+apiVersion: v2
+name: fluxgate
+description: Lightweight GitOps-driven Pingora API gateway enhancing traefik-ingress with hybrid traffic steering (CF Worker Free priority + Go fallback) and sensitive-only Vault KV credentials.
+type: application
+version: 0.3.0
+appVersion: "0.3.0"
+home: https://github.com/ai-workspace-xstream/fluxgate
+sources:
+  - https://github.com/ai-workspace-xstream/fluxgate
+keywords:
+  - fluxgate
+  - pingora
+  - traefik
+  - hybrid-gateway
+  - gitops
+  - cloudflare-workers

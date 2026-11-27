@@ -1,0 +1,52 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "fluxgate.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fluxgate.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "fluxgate.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.traefikSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- if .Values.metrics.enabled }}
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.metrics.port }}
+    {{- end }}
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.goFallbackNamespace | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.traefikExtension.fallbackService.port }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.vaultNamespace | quote }}
+      ports:
+        - protocol: TCP
+          port: 8200
+{{- end }}

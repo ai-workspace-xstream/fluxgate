@@ -150,6 +150,7 @@ pub enum Directive {
         param: String,
     },
     ReverseProxy(ReverseProxyConfig),
+    HybridProxy(HybridProxyConfig),
     Respond(RespondConfig),
 }
 
@@ -159,18 +160,70 @@ pub const DEFAULT_H2_PING_INTERVAL_SECS: u64 = 15;
 pub const DEFAULT_MAX_H2_STREAMS: usize = 256;
 pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 3600;
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 3600;
+pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReverseProxyConfig {
     pub upstream: UpstreamTarget,
     pub flush_interval: i32,
     pub transport: TransportConfig,
+    pub rewrite_host: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpstreamTarget {
     Tcp(String),
     Uds(PathBuf),
+    Https {
+        addr: String,
+        sni: String,
+        rewrite_host: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HybridMode {
+    #[default]
+    WeightedFailover,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StickyKeySpec {
+    Header(String),
+    ClientIp,
+    Path,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HybridUpstreamRole {
+    #[default]
+    Primary,
+    Fallback,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HybridUpstreamConfig {
+    pub name: String,
+    pub target: UpstreamTarget,
+    pub weight: u32,
+    pub role: HybridUpstreamRole,
+    pub connect_timeout_ms: u64,
+    pub read_timeout_ms: u64,
+    pub daily_budget: Option<u64>,
+    pub fallback_on_status: Vec<u16>,
+    pub fallback_on_headers: Vec<(String, String)>,
+    pub headers_up: Vec<(String, SecretRef)>,
+    pub flush_interval: i32,
+    pub transport: TransportConfig,
+    pub rewrite_host: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HybridProxyConfig {
+    pub mode: HybridMode,
+    pub sticky_key: Option<StickyKeySpec>,
+    pub retry_safe_methods: Vec<String>,
+    pub upstreams: Vec<HybridUpstreamConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

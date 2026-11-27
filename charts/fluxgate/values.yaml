@@ -1,0 +1,170 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/ai-workspace-xstream/fluxgate
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 8080
+  metricsPort: 9102
+  annotations: {}
+
+metrics:
+  enabled: true
+  port: 9102
+  path: /metrics
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 24Mi
+  limits:
+    cpu: 250m
+    memory: 64Mi
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 3
+  periodSeconds: 10
+  timeoutSeconds: 2
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  timeoutSeconds: 2
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Sensitive credentials only (never routing rules or weights):
+# e.g. Vault KV path prod/serverless/cloudflare keys CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN.
+vault:
+  enabled: false
+  addr: "https://vault.svc.plus"
+  envSecretName: ""
+
+externalSecret:
+  enabled: false
+  apiVersion: external-secrets.io/v1beta1
+  refreshInterval: "5m"
+  secretStoreRef:
+    name: vault-backend
+    kind: ClusterSecretStore
+  remotePath: "prod/serverless/cloudflare"
+  keys:
+    - CLOUDFLARE_ACCOUNT_ID
+    - CLOUDFLARE_API_TOKEN
+  targetSecretName: ""
+
+# Non-sensitive GitOps routing and proportional weights live in this ConfigMap.
+# Mounted as a directory at /etc/fluxgate (without subPath) so Fluxgate's 5s file-hash
+# reloader triggers atomic ArcSwap hot reloads without pod restarts.
+config:
+  fluxgatefile: |
+    {
+        http_port 8080
+        grace_period 15s
+        metrics 0.0.0.0:9102
+    }
+
+    accounts.svc.plus accounts-selfhost-prod-v6.svc.plus {
+        @health path /healthz
+        handle @health {
+            respond "ok" 200
+        }
+
+        @agent_sse path /api/agent-server/v1/users/events
+        handle @agent_sse {
+            reverse_proxy http://web-saas-xconnect-controller.web-saas-prod.svc.cluster.local:80
+        }
+
+        @xconnect_dual path /api/agent-server/v1/* /api/overlay/v1/* /api/auth/sync/*
+        handle @xconnect_dual {
+            hybrid_proxy {
+                mode weighted_failover
+                sticky_key header(Authorization)
+                retry_safe_methods GET HEAD OPTIONS
+
+                upstream cf_worker https://xconnect-controller-edge.manbuzhe2008.workers.dev {
+                    weight 80
+                    rewrite_host xconnect-controller-edge.manbuzhe2008.workers.dev
+                    header_up X-Forwarded-By fluxgate-hybrid
+                    connect_timeout 800ms
+                    read_timeout 2000ms
+                    daily_budget 85000
+                    fallback_on_status 429 501 502 503 504 522 524
+                    fallback_on_header X-XConnect-Fallback=origin-go
+                }
+
+                upstream go_origin http://web-saas-xconnect-controller.web-saas-prod.svc.cluster.local:80 {
+                    weight 20
+                    role fallback
+                    connect_timeout 2000ms
+                    read_timeout 15000ms
+                }
+            }
+        }
+    }
+
+# Optional pluggable Traefik enhancement in the same namespace (e.g. ingress-prod).
+# Disabled by default. When enabled, creates a TraefikService with spec.failover
+# pointing to Fluxgate and falling back directly to the in-cluster Go service if
+# Fluxgate fails healthCheck or returns 502-504, keeping traefik-ingress resilient.
+traefikExtension:
+  enabled: false
+  routeName: xconnect-dual-hybrid
+  entryPoints:
+    - websecure
+  match: "Host(`accounts.svc.plus`) && (PathPrefix(`/api/agent-server/v1`) || PathPrefix(`/api/overlay/v1`) || PathPrefix(`/api/auth/sync`))"
+  priority: 250
+  failoverErrorsStatus:
+    - "502-504"
+  healthCheck:
+    path: /healthz
+    interval: 5s
+    timeout: 1s
+  fallbackService:
+    name: web-saas-xconnect-controller
+    namespace: web-saas-prod
+    port: 80
+  tls: {}
+
+networkPolicy:
+  enabled: false
+  traefikSelector:
+    app.kubernetes.io/name: traefik
+  goFallbackNamespace: web-saas-prod
+  vaultNamespace: vault-prod

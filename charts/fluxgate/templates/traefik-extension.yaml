@@ -1,0 +1,51 @@
+{{- if .Values.traefikExtension.enabled }}
+apiVersion: traefik.io/v1alpha1
+kind: TraefikService
+metadata:
+  name: {{ include "fluxgate.fullname" . }}-failover
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fluxgate.labels" . | nindent 4 }}
+spec:
+  failover:
+    service:
+      name: {{ include "fluxgate.fullname" . }}
+      port: {{ .Values.service.port }}
+      healthCheck:
+        path: {{ .Values.traefikExtension.healthCheck.path | quote }}
+        interval: {{ .Values.traefikExtension.healthCheck.interval | quote }}
+        timeout: {{ .Values.traefikExtension.healthCheck.timeout | quote }}
+    fallback:
+      name: {{ .Values.traefikExtension.fallbackService.name | quote }}
+      namespace: {{ .Values.traefikExtension.fallbackService.namespace | quote }}
+      port: {{ .Values.traefikExtension.fallbackService.port }}
+    errors:
+      status:
+        {{- range .Values.traefikExtension.failoverErrorsStatus }}
+        - {{ . | quote }}
+        {{- end }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ .Values.traefikExtension.routeName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fluxgate.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    {{- range .Values.traefikExtension.entryPoints }}
+    - {{ . | quote }}
+    {{- end }}
+  routes:
+    - match: {{ .Values.traefikExtension.match | quote }}
+      kind: Rule
+      priority: {{ .Values.traefikExtension.priority }}
+      services:
+        - name: {{ include "fluxgate.fullname" . }}-failover
+          kind: TraefikService
+  {{- with .Values.traefikExtension.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

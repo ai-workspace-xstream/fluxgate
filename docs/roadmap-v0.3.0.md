@@ -37,9 +37,9 @@
 ### 1.2 总体架构（L3 DNS GTM + L7 蜂群双层协同）
 
 ```
-        Vault KV v2 (kv/data/prod/fluxgate/dns-tokens & gtm-policy)
-                     │  1. {vault.dns.cf_api_token} / {vault.dns.ali_*} (Zeroize 内存驻留)
-                     │  2. KV v2 CAS 乐观锁选主 (全群唯一 GTM Coordinator 避免 API 冲突)
+        Vault KV v2 (kv/data/prod/serverless/cloudflare)
+                     │  1. {vault.cloudflare.CLOUDFLARE_API_TOKEN} / CLOUDFLARE_ACCOUNT_ID (仅存敏感凭据)
+                     │  2. KV v2 CAS 乐观锁选主 (可选 GTM Coordinator 避免 DNS API 并发冲突)
                      ▼
    ┌─────────────────────────────────────────────────────────────────────┐
    │ L3 入口调度层: Cloudflare DNS / Paid LB  或  阿里云智能 DNS (AliDNS) │
@@ -359,33 +359,34 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
 
 #### 4.3 主流规范 DNS 服务商插件化矩阵（`DnsRecordProvider` 标准接口）
 
-将 `v0.2.0` 原有仅面向 ACME `_acme-challenge` TXT 记录的 `DnsProvider` 抽象升级为完整的 **`DnsRecordProvider` 标准接口**（统一封装 `list_records`、`upsert_record`、`delete_record`、`update_weight`），所有凭据均通过 `{vault.dns.*}` 内存注入：
+将 `v0.2.0` 原有仅面向 ACME `_acme-challenge` TXT 记录的 `DnsProvider` 抽象升级为完整的 **`DnsRecordProvider` 标准接口**（统一封装 `list_records`、`upsert_record`、`delete_record`、`update_weight`），所有敏感 API 凭据均通过 Vault KV 内存注入：
 
-| DNS 服务商 (`provider`) | 认证方式（Vault KV 引用） | 核心支持能力与规范 API |
+| DNS 服务商 (`provider`) | 认证方式（Vault KV 仅存敏感凭据） | 核心支持能力与规范 API |
 | :--- | :--- | :--- |
-| **`cloudflare`** | `{vault.dns.cf_api_token}`（Bearer Token，Zone DNS Edit 权限） | Cloudflare API v4 `/zones/:id/dns_records`（自动 `insert`/`PATCH`/`DELETE` `A`/`AAAA`/`SRV`/`TXT` 及 `comment` 所有权标记）+ 付费版 Load Balancer Pools API。 |
-| **`alidns`**（阿里云智能 DNS） | `{vault.dns.ali_access_key_id}` + `{vault.dns.ali_access_key_secret}` | 阿里云 OpenAPI v2/v3（`AddDomainRecord` / `UpdateDomainRecord` / `SetDNSSLBStatus` / `UpdateDNSSLBWeight` / `UpdateDomainRecordRemark`），原生支持 `1~100` 权重 SLB 与分运营商/分地域智能线路（`default` / `overseas` / `telecom` / `unicom` / `mobile`）。 |
-| **`route53`**（AWS Route 53） | `{vault.dns.aws_access_key_id}` + `{vault.dns.aws_secret_access_key}` | 纯 Rust AWS SigV4 签名调用 `ChangeResourceRecordSets`（`UPSERT` / `DELETE`），原生支持 `SetIdentifier` + `Weight`（`0~255` 加权路由）与 `Region` 延迟路由。 |
-| **`dnspod`**（腾讯云 DNSPod） | `{vault.dns.dnspod_secret_id}` + `{vault.dns.dnspod_secret_key}` | 腾讯云 API v3 `TC3-HMAC-SHA256` 签名（`CreateRecord` / `ModifyRecord` / `DeleteRecord`），支持记录级 `Weight`（`1~100`）与分线路智能解析。 |
+| **`cloudflare`** | `{vault.cloudflare.CLOUDFLARE_API_TOKEN}` + `{vault.cloudflare.CLOUDFLARE_ACCOUNT_ID}`（`prod/serverless/cloudflare`） | Cloudflare API v4 `/zones/:id/dns_records`（自动 `insert`/`PATCH`/`DELETE` `A`/`AAAA`/`SRV`/`TXT` 及 `comment` 所有权标记）+ 付费版 Load Balancer Pools API。 |
+| **`alidns`**（阿里云智能 DNS） | `{vault.alidns.access_key_id}` + `{vault.alidns.access_key_secret}` | 阿里云 OpenAPI v2/v3（`AddDomainRecord` / `UpdateDomainRecord` / `SetDNSSLBStatus` / `UpdateDNSSLBWeight` / `UpdateDomainRecordRemark`），原生支持 `1~100` 权重 SLB 与分运营商/分地域智能线路（`default` / `overseas` / `telecom` / `unicom` / `mobile`）。 |
+| **`route53`**（AWS Route 53） | `{vault.route53.aws_access_key_id}` + `{vault.route53.aws_secret_access_key}` | 纯 Rust AWS SigV4 签名调用 `ChangeResourceRecordSets`（`UPSERT` / `DELETE`），原生支持 `SetIdentifier` + `Weight`（`0~255` 加权路由）与 `Region` 延迟路由。 |
+| **`dnspod`**（腾讯云 DNSPod） | `{vault.dnspod.secret_id}` + `{vault.dnspod.secret_key}` | 腾讯云 API v3 `TC3-HMAC-SHA256` 签名（`CreateRecord` / `ModifyRecord` / `DeleteRecord`），支持记录级 `Weight`（`1~100`）与分线路智能解析。 |
 
-#### 4.4 Vault KV v2 凭据加载与 CAS 选主协调（防 API 并发冲突）
+#### 4.4 Vault KV v2 凭据加载与 CAS 选主协调（安全边界与防并发冲突）
 
-1. **API 凭据全内存驻留（Zeroize）**
-   - 通过 `vault { sync dns kv/data/prod/fluxgate/dns-tokens 5m }` 动态加载 `{vault.dns.cf_api_token}` 或 `{vault.dns.ali_access_key_id}` / `{vault.dns.ali_access_key_secret}`。
-   - 凭据使用 `Zeroizing<String>` 封装，严格通过 `--strict-gitops` 校验，禁止任何明文 API Key 出现在 `Fluxgatefile` 或 Git 仓库。
+1. **严格边界：Vault KV 只加载敏感凭据（Zeroize 全内存驻留）**
+   - 通过 `vault { sync cloudflare kv/data/prod/serverless/cloudflare 5m }` 仅同步 `CLOUDFLARE_ACCOUNT_ID` 与 `CLOUDFLARE_API_TOKEN` 等敏感 API 凭据（供 DNS 记录调整及 ACME/GTM 使用）。
+   - **非敏感配置（域名列表、路由规则、灰度权重比例、线路策略）严禁写入 Vault KV**，统一由 GitOps（`Fluxgatefile` / Helm `ConfigMap`）声明并通过 `ArcSwap` 热加载。
+   - 所有敏感凭据使用 `Zeroizing<String>` 封装，严格通过 `--strict-gitops` 校验，禁止任何明文 API Token/Key 出现在 `Fluxgatefile` 或 Git 仓库。
 2. **Vault KV CAS 唯一 Coordinator 选主**
    - 为避免蜂群内 $N$ 台节点同时调用 Cloudflare / 阿里云 DNS API 修改统一入口域名（如 `jp-xconnect-plus.svc.plus`）造成竞态或触发 API Rate Limit，复用 [src/acme/storage.rs](file:///Users/shenlan/workspaces/fluxgate/src/acme/storage.rs) 已验证的 **Vault KV v2 CAS（Check-And-Set）乐观锁租约机制**：
    - 路径：`kv/data/prod/fluxgate/gtm-locks/<group>`（如 `jp-plus`），租约字段包含 `coordinator_node_id`、`lease_until_unix`（默认 `45s`）、`last_dns_hash`。
    - **仅持有有效 CAS 租约的唯一 Coordinator 节点**每 `15s` 汇总全蜂群 Gossip 负载表并对比目标 DNS 状态；仅当节点健康集或权重分档发生实质变化时才发起 DNS API 调用（幂等差分更新）。
    - 若 Coordinator 节点宕机或维护下线，租约到期后其余 `Alive` 节点自动通过 CAS 接管 Coordinator 角色。
 
-#### 4.5 三级 GTM 调度与付费高级灰度切流能力
+#### 4.5 三级 GTM 调度与 GitOps 灰度切流能力
 
 1. **Tier 1：Cloudflare 标准版 — 动态多 A/AAAA 健康池（Zero-Cost Multi-A Pool）**
    - 适用场景：免费/标准 Cloudflare DNS 区域，低成本实现高可用与过载保护。
    - 调度逻辑：
      - 统一入口域名 `jp-xconnect-plus.svc.plus` 同时挂载蜂群内所有状态为 `Alive` 且 $S_i < \text{high\_watermark}$ 的节点公网 IP（`proxied = false`，`ttl = 60`），同时保留各节点独立域名（`jp-xconnect-plus-01.svc.plus`、`jp-xconnect-plus-02.svc.plus`）不变。
-     - 当 `01` 节点过载（$S_1 \ge 85$）、进入 `Draining` 或宕机时，Coordinator 自动调用 Cloudflare API `DELETE /zones/:zone_id/dns_records/:record_id` 将 `01` 的 IP 从统一入口 `jp-xconnect-plus.svc.plus` 临时摘除，新客户端解析 100% 落入 `02` 及其他健康节点；
+     - 当 `01` 节点过载（$S_1 \ge 85$）、进入 `Draining` 或宕机时，Coordinator 使用 Vault KV 中的 `{vault.cloudflare.CLOUDFLARE_API_TOKEN}` 调用 Cloudflare API `DELETE /zones/:zone_id/dns_records/:record_id` 将 `01` 的 IP 从统一入口 `jp-xconnect-plus.svc.plus` 临时摘除，新客户端解析 100% 落入 `02` 及其他健康节点；
      - 当 `01` 负载回落至 $S_1 \le \text{low\_watermark}$（`70`）并稳定保持 2 个周期后，自动重新挂载回统一入口池。
      - **保底安全阀（`min_healthy_nodes = 1`）**：若全群所有节点均超过 `high_watermark`，保留负载相对最低的节点记录，**绝不清空域名的全部 A 记录**。
 2. **Tier 2：阿里云智能云解析（AliDNS）— 动态权重 SLB + 灰度切流 + 智能地域/运营商线路**
@@ -393,24 +394,18 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
    - 调度逻辑（扩展 [src/acme/dns.rs](file:///Users/shenlan/workspaces/fluxgate/src/acme/dns.rs) 中的 `AliDnsProvider`）：
      - **开启权重负载均衡**：调用阿里云 OpenAPI `SetDNSSLBStatus` 开启 `jp-xconnect-plus.svc.plus` 子域名权重路由；
      - **基于实时负载与灰度比例的动态权重计算**：
-       每个健康节点 $i$ 的目标 DNS 权重 $W_i \in [1, 100]$ 由**实时空闲容量**与**灰度系数 $\gamma_i \in [0.0, 1.0]$** 共同决定：
+       每个健康节点 $i$ 的目标 DNS 权重 $W_i \in [1, 100]$ 由**实时空闲容量**与**GitOps 声明的灰度系数 $\gamma_i \in [0.0, 1.0]$** 共同决定：
        $$W_i = \max\left(1,\; \text{round}\left((100 - S_i) \times \gamma_i\right)\right)$$
-     - **付费用户高级流量灰度切换（Canary Rollout）**：
-       运维或控制面可在 Vault KV `kv/data/prod/fluxgate/gtm-canary/jp-plus` 中动态写入灰度策略（无需重启 Fluxgate，由 `VaultSyncService` 热同步）：
-       ```json
-       {
-         "canary_weights": {
-           "jp-xconnect-plus-01.svc.plus": 1.0,
-           "jp-xconnect-plus-02.svc.plus": 1.0,
-           "jp-xconnect-plus-03.svc.plus": 0.10
-         },
-         "lines": {
-           "jp-xconnect-plus-01.svc.plus": "default",
-           "jp-xconnect-plus-02.svc.plus": "overseas"
-         }
-       }
+     - **GitOps 声明式灰度切换（Canary Rollout）**：
+       运维或控制面通过 GitOps（`Fluxgatefile` / Helm `values.yaml`）声明非敏感灰度系数与线路映射（由 5s 文件哈希检测 + `ArcSwap` 零中断热加载，**不存 Vault KV**）：
+       ```caddyfile
+       canary_weight jp-xconnect-plus-01.svc.plus 1.0
+       canary_weight jp-xconnect-plus-02.svc.plus 1.0
+       canary_weight jp-xconnect-plus-03.svc.plus 0.10
+       line jp-xconnect-plus-01.svc.plus default
+       line jp-xconnect-plus-02.svc.plus overseas
        ```
-       新节点 `jp-xconnect-plus-03` 上线初期可先分配 `10%`（`0.10`）灰度权重观察稳定性，验证无误后通过修改 Vault KV 渐进调升至 `50% -> 100%`；若异常则一键置为 `0.0` 秒级切走。
+       新节点 `jp-xconnect-plus-03` 上线初期可先分配 `10%`（`0.10`）灰度权重观察稳定性，验证无误后通过 Git PR 渐进调升至 `50% -> 100%`；紧急排空则通过 `fluxgate swarm drain` 或将权重置 `0.0` 秒级切走。
      - **分线路智能解析（Geo / ISP Line Routing）**：支持按阿里云解析线路（`default`、`telecom`、`unicom`、`mobile`、`overseas`）绑定最优节点。
 3. **Tier 3：Cloudflare Paid Load Balancing — 动态 Steering 权重池与地理位置路由**
    - 适用场景：已开通 Cloudflare Load Balancing 付费订阅的高级租户/专有池。
@@ -483,11 +478,114 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
 
 ---
 
+### 特性 6：双形态混合流量调度（Hybrid Dual-Form API Steering：K3s `traefik-ingress` 非侵入式协同增强 + Helm Chart + GitOps + Vault KV 敏感凭据边界）
+
+**核心定位**：**Fluxgate 是 `traefik-ingress` 的增强与扩展插件，绝不替代 `traefik-ingress`**。
+- K3s 公网入口 **`traefik-ingress`（`namespace: ingress-prod`）** 保持 100% 不变，在**没有部署 Fluxgate 或 Fluxgate 异常停机的前提下，`traefik-ingress` 保持正常独立工作**；
+- Fluxgate 通过独立 Helm Chart（[charts/fluxgate](file:///Users/shenlan/workspaces/fluxgate/charts/fluxgate)）作为**独立 `HelmRelease` 部署在同一个 `ingress-prod` 命名空间**（常驻 `< 15–25 MiB`），由 GitOps `ConfigMap` + `5s` `ArcSwap` 热加载驱动比例切流，面向双形态 API 优先调度至 **Cloudflare Worker Free**（`100,000 req/day`），并以集群内 **Go 自部署 ClusterIP** 作为确定性兜底；
+- **Vault KV 严格边界**：Vault KV **仅用于加载敏感凭据**（如 `kv/data/prod/serverless/cloudflare` 下的 `CLOUDFLARE_ACCOUNT_ID` 与 `CLOUDFLARE_API_TOKEN` 用于 DNS 调整，或上游敏感鉴权 Header），**路由与流量权重（`80`/`20`）由 GitOps 配置管理，禁止存入 Vault KV**。
+
+#### 2.6.0 `ingress-prod` 同命名空间协同与独立降级拓扑
+
+```mermaid
+flowchart LR
+    Client["公网客户端 / Agent"] -->|"HTTPS 443 (*.svc.plus)"| Traefik["traefik-ingress (ingress-prod)<br/>唯一公网入口 · 独立完整工作"]
+    Traefik -->|"核心 IAM / 计费路由"| Accounts["web-saas-accounts / billing<br/>(ClusterIP)"]
+    Traefik -->|"未安装 Fluxgate 或 healthCheck/502-504 降级<br/>TraefikService failover 直连"| GoOrigin["Go 自部署服务<br/>(web-saas-xconnect-controller:80)"]
+    Traefik -->|"已启用 Fluxgate 扩展 (HTTP :8080)"| Fluxgate["fluxgate HelmRelease (ingress-prod)<br/>Rust + Pingora (< 25 MiB RSS)"]
+
+    GitOps["GitOps Helm / ConfigMap<br/>(Fluxgatefile 比例权重 80/20)"] -.->|"5s 文件哈希自检 + ArcSwap<br/>非敏感配置热重载"| Fluxgate
+    Vault["Vault KV v2<br/>prod/serverless/cloudflare"] -.->|"仅同步敏感凭据 (用于 DNS 调整)<br/>CLOUDFLARE_ACCOUNT_ID / API_TOKEN"| Fluxgate
+
+    Fluxgate -->|"主路径 (如 80% 权重, HTTPS + SNI + Host 重写)"| CFWorker["Cloudflare Worker Free<br/>(xconnect-controller-edge)"]
+    Fluxgate -->|"兜底路径 (20% 权重 / 失败回切 / SSE 直通)"| GoOrigin
+```
+
+#### 2.6.1 声明式 `hybrid_proxy` DSL 规范（GitOps 权重 + Vault KV 仅载敏感凭据）
+
+```caddyfile
+{
+    http_port 8080
+    metrics 0.0.0.0:9102
+
+    # Vault KV 仅加载敏感凭据（例如操作 Cloudflare DNS 调整的 Account ID / API Token）
+    vault {
+        addr env(VAULT_ADDR)
+        auth token
+        sync cloudflare kv/data/prod/serverless/cloudflare 5m
+    }
+}
+
+accounts.svc.plus accounts-selfhost-prod-v6.svc.plus {
+    @health path /healthz
+    handle @health {
+        respond "ok" 200
+    }
+
+    # 1) 协议硬约束：SSE 长连接 100% 直落集群内 Go 自部署源站
+    @agent_sse path /api/agent-server/v1/users/events
+    handle @agent_sse {
+        reverse_proxy http://web-saas-xconnect-controller.web-saas-prod.svc.cluster.local:80
+    }
+
+    # 2) 双形态按比例混合调度：权重由 GitOps ConfigMap 控制（禁止写入 Vault KV）
+    @xconnect_dual path /api/agent-server/v1/* /api/overlay/v1/* /api/auth/sync/*
+    handle @xconnect_dual {
+        hybrid_proxy {
+            mode weighted_failover
+            sticky_key header(Authorization)   # 可选：header(<Name>) | client_ip | path
+            retry_safe_methods GET HEAD OPTIONS
+
+            upstream cf_worker https://xconnect-controller-edge.manbuzhe2008.workers.dev {
+                weight 80                      # 非敏感整数权重（GitOps + 5s ArcSwap 热重载）
+                rewrite_host xconnect-controller-edge.manbuzhe2008.workers.dev
+                header_up X-Forwarded-By fluxgate-hybrid
+                connect_timeout 800ms
+                read_timeout 2000ms
+                daily_budget 85000             # Phase H2：CF Free 日配额软熔断水位
+                fallback_on_status 429 501 502 503 504 522 524
+                fallback_on_header X-XConnect-Fallback=origin-go
+            }
+
+            upstream go_origin http://web-saas-xconnect-controller.web-saas-prod.svc.cluster.local:80 {
+                weight 20
+                role fallback
+                connect_timeout 2000ms
+                read_timeout 15000ms
+            }
+        }
+    }
+}
+```
+
+#### 2.6.2 核心架构机制与独立 Helm Chart
+
+1. **异构 HTTPS + SNI + Host 重写上游底座（Phase H1）**
+   - 扩展 `UpstreamTarget` 新增 `Https { addr, sni, rewrite_host }`，在 Pingora `upstream_peer()` 阶段异步解析域名并启用 TLS + ALPN（`H2H1`）连接池复用；
+   - 在 `upstream_request_filter()` 自动将原请求 `Host` 保存至 `X-Forwarded-Host`，并将上游 `Host` 重写为 `*.workers.dev` 或自定义边缘域名，避免 Cloudflare Error 1003/404。
+2. **GitOps 无锁比例分流与 Vault 安全边界（Phase H1）**
+   - 未配置 `sticky_key` 时采用 `AtomicU64` 无锁平滑轮询；配置 `sticky_key`（如 `header(Authorization)`、`client_ip`、`path`）时通过 `FNV-1a 64-bit` 确定性哈希（`hash % total_weight`）保证同一用户/设备在 `10% -> 50% -> 80% -> 100%` 灰度期间稳定命中同一形态；
+   - 解析器显式拒绝在 `weight` 中引用 `{vault.*}`，守住 **Vault KV 只存放敏感凭据（如 `prod/serverless/cloudflare` 的 `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN`）** 的安全边界；
+   - 当主形态连接失败且请求方法属于 `retry_safe_methods`（默认 `GET`/`HEAD`/`OPTIONS`）且未写出响应头时，自动单次透明回切至 `role fallback` 的 Go 源站，并注入 `X-Fluxgate-Upstream` 与 `X-Fluxgate-Fallback` 诊断响应头。
+3. **独立 Helm Chart 与 `traefik-ingress` 非侵入式协同（Phase H1）**
+   - 新增独立 Chart [charts/fluxgate](file:///Users/shenlan/workspaces/fluxgate/charts/fluxgate)，作为独立 `HelmRelease` 部署于 `ingress-prod` 命名空间，与 `traefik-ingress` 同域零冲突；
+   - 默认 `traefikExtension.enabled=false`，开启后通过 `TraefikService`（`spec.failover` + `healthCheck /healthz` + `errors.status: ["502-504"]`）将混合调度能力平滑挂载至 `traefik-ingress`；一旦卸载 Fluxgate 或健康检查失败，Traefik 自动直落 `fallback` Go 服务，绝不影响 `traefik-ingress` 独立正常工作；
+   - Deployment 直接挂载 ConfigMap 目录（不设 `subPath`），配合 5s 文件哈希检测 + `ArcSwap` 实现 Kubernetes 下变更自动热生效。
+4. **CF Worker Free 日配额软守卫与语义回切（Phase H2）**
+   - 进程内原子计数器按 UTC 自然日统计 `cf_worker` 调用量，达到 `daily_budget` 软阈值（如 `85,000`）自动将 `cf_worker` 有效权重归零，100% 平滑回落 `go_origin`，UTC 00:00 自动恢复；
+   - 对幂等请求命中 `429`、`501` 或 `X-XConnect-Fallback: origin-go` 时执行语义回切与被动熔断（`Open` -> `Half-Open`），非幂等写请求（`POST`/`PUT`/`DELETE`）严禁二次重放。
+5. **运行时动态调权、DNS 协同调整与可观测指标（Phase H3）**
+   - 复用 `/run/fluxgate/admin.sock` 支持 `fluxgate hybrid set-weight` / `status` 毫秒级一键切流，输出 `fluxgate_hybrid_*` Prometheus 指标，并可基于 `prod/serverless/cloudflare` 中的 `CLOUDFLARE_ACCOUNT_ID` 与 `CLOUDFLARE_API_TOKEN` 执行自动化 DNS 记录调整。
+
+---
+
 ## 3. 代码模块落地映射
 
 | 模块路径 | 变更类型 | 核心职责与实现设计 |
 | :--- | :---: | :--- |
-| [src/config/ast.rs](file:///Users/shenlan/workspaces/fluxgate/src/config/ast.rs) | 修改 | 1. `GlobalConfig` 新增 `pub swarm: Option<SwarmConfig>`（内含 `pub gtm: Option<SwarmGtmConfig>`）；<br/>2. `ReverseProxyConfig` 新增 `pub swarm_spillover: Option<SwarmSpilloverConfig>`；<br/>3. `UpstreamTarget` 新增 `SwarmPeer { node_id: String, addr: String, sni: String }`。 |
+| [src/config/ast.rs](file:///Users/shenlan/workspaces/fluxgate/src/config/ast.rs) | 修改 | 1. `GlobalConfig` 新增 `pub swarm: Option<SwarmConfig>`（内含 `pub gtm: Option<SwarmGtmConfig>`）；<br/>2. `ReverseProxyConfig` 新增 `pub swarm_spillover: Option<SwarmSpilloverConfig>` 与 `pub rewrite_host: Option<String>`；<br/>3. `UpstreamTarget` 新增 `Https { addr, sni, rewrite_host }` 与 `SwarmPeer { node_id: String, addr: String, sni: String }`；<br/>4. `Directive` 新增 `HybridProxy(HybridProxyConfig)`。 |
+| [src/hybrid/mod.rs](file:///Users/shenlan/workspaces/fluxgate/src/hybrid/mod.rs) | 新增 | 双形态混合调度核心引擎：`CompiledHybridPool`、`FNV-1a` 确定性粘滞哈希、`AtomicU64` 无锁比例选路、连接失败安全回切候选计算，以及后续 Phase H2 日配额守卫与熔断器扩展。 |
+| [charts/fluxgate](file:///Users/shenlan/workspaces/fluxgate/charts/fluxgate) & [Dockerfile](file:///Users/shenlan/workspaces/fluxgate/Dockerfile) | 新增 | 独立 Fluxgate Helm Chart（部署于 `ingress-prod` 协同 `traefik-ingress`，支持 `TraefikService` failover 降级、`ExternalSecret` 对接 Vault `prod/serverless/cloudflare`、ConfigMap 目录热挂载）及多阶段 `debian:bookworm-slim` 容器镜像定义。 |
 | [src/config/parser.rs](file:///Users/shenlan/workspaces/fluxgate/src/config/parser.rs) & [validate.rs](file:///Users/shenlan/workspaces/fluxgate/src/config/validate.rs) | 修改 | 支持从 `/etc/fluxgate/conf.d/Swarm-Grouping-Mode.conf` 等 `import` 子文件中增量合并 `{ vault { ... } swarm { ... gtm { ... } } }` 全局块或直接解析顶层 `swarm { ... }`；校验水位关系与 `min_healthy_nodes >= 1`；在 `--strict-gitops` 下强制要求 `shared_key` 与 GTM DNS API 凭据使用 `{vault.*}` 或 `env(*)`。 |
 | `src/swarm/mod.rs` | 新增 | `SwarmManager` 核心门面：整合 `LocalLoadEstimator`、`PeerTable`（`ArcSwap` 快照）、`AffinityTable` 与 P2C 选路器 `select_upstream()`。 |
 | `src/swarm/score.rs` | 新增 | `LocalLoadEstimator`：聚合 `active_connections`、`/proc/self/statm` RSS、EWMA 延迟与本地 UDS 错误计数，每秒更新 `AtomicU8` `load_score`。 |
@@ -543,3 +641,13 @@ Xray 的 XHTTP 传输层（`packet-up` / `stream-up` / `stream-one`）将一个�
 - **验收标准**：
   - 单点向 `jp-xconnect-plus-01.svc.plus` 打入 `500 VUs` K6 极限压测流量，当 `01` 达到高水位后，L7 超额会话即时无感溢出至 `jp-xconnect-plus-02.svc.plus`，同时 L3 GTM 自动调整 `jp-xconnect-plus.svc.plus` 权重将后续新建客户端导向 `02`；
   - 压测全程可用性 **`100.00%`**，单机 `Fluxgate` 内存增幅 `< 10 MiB`（控制面开销 `< 2 MiB`），客户端零感知断流。
+
+### Phase H1 ~ H3：双形态混合流量调度专项里程碑（Hybrid Dual-Form API Steering）
+- **Phase H1（HTTPS 上游底座 + `hybrid_proxy` GitOps 切流 + 独立 Helm Chart 与 Vault 凭据边界）**：
+  - 支持 `https://` / `http://` 上游解析、TLS SNI + ALPN `H2H1`、`rewrite_host` + `X-Forwarded-Host` 注入；
+  - 支持 `hybrid_proxy` GitOps 权重分流、`sticky_key`（`header(...)` / `client_ip` / `path`）确定性分桶，显式禁止将权重存入 Vault KV，支持幂等请求连接失败单次回切 `role fallback`；
+  - 交付 `Dockerfile` 与独立 Helm Chart `charts/fluxgate`（同命名空间 `ingress-prod` 配合 `traefik-ingress` 协同扩展，缺省 Fluxgate 时 `traefik-ingress` 100% 独立工作；`ExternalSecret` 仅从 Vault KV `prod/serverless/cloudflare` 加载 `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN`）。
+- **Phase H2（CF Worker Free 日配额软熔断 + 语义状态码/Header 回切）**：
+  - 完成 `daily_budget` UTC 自然日原子配额守卫、`fallback_on_status`（`429`/`501`/`5xx`）与 `fallback_on_header`（如 `X-XConnect-Fallback=origin-go`）透明回切及被动熔断器。
+- **Phase H3（`admin.sock` 动态热调权 + DNS 协同与 Prometheus 指标）**：
+  - 支持 `fluxgate hybrid set-weight / status` 零中断调权、`fluxgate_hybrid_*` 指标，以及基于 `prod/serverless/cloudflare` 凭据的 Cloudflare DNS 自动调整与线上灰度实测验收。
