@@ -2,6 +2,7 @@ pub mod acme;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod hybrid;
 pub mod metrics;
 pub mod proxy;
 pub mod tls;

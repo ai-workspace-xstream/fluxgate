@@ -149,6 +149,34 @@ impl Parser {
                     })?;
                     global.grace_period_secs = secs;
                 }
+                "http_port" => {
+                    let val_tok = cursor.expect_word("http_port number (1..65535)")?;
+                    let raw = val_tok.kind_word();
+                    let port = raw
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|&p| p > 0)
+                        .ok_or_else(|| FluxgateError::ConfigSyntax {
+                            file: val_tok.file,
+                            line: val_tok.line,
+                            msg: format!("Invalid http_port '{}'", raw),
+                        })?;
+                    global.http_port = port;
+                }
+                "https_port" => {
+                    let val_tok = cursor.expect_word("https_port number (1..65535)")?;
+                    let raw = val_tok.kind_word();
+                    let port = raw
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|&p| p > 0)
+                        .ok_or_else(|| FluxgateError::ConfigSyntax {
+                            file: val_tok.file,
+                            line: val_tok.line,
+                            msg: format!("Invalid https_port '{}'", raw),
+                        })?;
+                    global.https_port = port;
+                }
                 "log" => {
                     // skip/parse log block: log [name] { level INFO }
                     if cursor.peek_kind() == Some(&TokenKind::OpenBrace)
@@ -352,6 +380,10 @@ impl Parser {
                     let rp = self.parse_reverse_proxy(cursor, tok)?;
                     directives.push(Directive::ReverseProxy(rp));
                 }
+                "hybrid_proxy" => {
+                    let hp = self.parse_hybrid_proxy(cursor, tok)?;
+                    directives.push(Directive::HybridProxy(hp));
+                }
                 "respond" => {
                     let body = cursor.expect_word("respond body")?.kind_word();
                     let status = if let Some(TokenKind::Word(s)) = cursor.peek_kind() {
@@ -458,6 +490,10 @@ impl Parser {
                     let rp = self.parse_reverse_proxy(cursor, tok)?;
                     directives.push(Directive::ReverseProxy(rp));
                 }
+                "hybrid_proxy" => {
+                    let hp = self.parse_hybrid_proxy(cursor, tok)?;
+                    directives.push(Directive::HybridProxy(hp));
+                }
                 "rewrite" => {
                     let target = cursor.expect_word("rewrite target path")?.kind_word();
                     directives.push(Directive::Rewrite {
@@ -478,7 +514,17 @@ impl Parser {
                 }
                 "respond" => {
                     let body = cursor.expect_word("respond body")?.kind_word();
-                    directives.push(Directive::Respond(RespondConfig { body, status: 200 }));
+                    let status = if let Some(TokenKind::Word(s)) = cursor.peek_kind() {
+                        if let Ok(code) = s.parse::<u16>() {
+                            cursor.next();
+                            code
+                        } else {
+                            200
+                        }
+                    } else {
+                        200
+                    };
+                    directives.push(Directive::Respond(RespondConfig { body, status }));
                 }
                 other => {
                     return Err(FluxgateError::ConfigSyntax {
@@ -503,22 +549,13 @@ impl Parser {
         cursor: &mut TokenCursor,
         _tok: Token,
     ) -> Result<ReverseProxyConfig> {
-        let upstream_str = cursor
-            .expect_word("reverse_proxy upstream address")?
-            .kind_word();
+        let addr_tok = cursor.expect_word("reverse_proxy upstream address")?;
+        let upstream_str = addr_tok.kind_word();
         let mut transport = TransportConfig::default();
-        let upstream = if let Some(rest) = upstream_str.strip_prefix("unix+h2c/") {
-            let abs = format!("/{}", rest.trim_start_matches('/'));
-            transport.h2c = true;
-            transport.versions = vec!["h2c".to_string(), "2".to_string()];
-            UpstreamTarget::Uds(PathBuf::from(abs))
-        } else if let Some(rest) = upstream_str.strip_prefix("unix/") {
-            let abs = format!("/{}", rest.trim_start_matches('/'));
-            UpstreamTarget::Uds(PathBuf::from(abs))
-        } else if let Some(rest) = upstream_str.strip_prefix("unix:") {
-            UpstreamTarget::Uds(PathBuf::from(rest))
-        } else {
-            UpstreamTarget::Tcp(upstream_str)
+        let mut upstream = parse_upstream_target(&upstream_str, &addr_tok, &mut transport)?;
+        let mut rewrite_host = match &upstream {
+            UpstreamTarget::Https { rewrite_host, .. } => rewrite_host.clone(),
+            _ => None,
         };
 
         let mut flush_interval = -1;
@@ -542,100 +579,31 @@ impl Parser {
                         let val = cursor.expect_word("flush_interval value")?.kind_word();
                         flush_interval = val.parse::<i32>().unwrap_or(-1);
                     }
-                    "transport" => {
-                        let proto_tok = cursor.expect_word("transport protocol (e.g. http)")?;
-                        let proto = proto_tok.kind_word();
-                        if proto != "http" {
+                    "rewrite_host" => {
+                        let host_val = cursor.expect_word("rewrite_host hostname")?.kind_word();
+                        rewrite_host = Some(host_val.clone());
+                        if let UpstreamTarget::Https {
+                            rewrite_host: ref mut rh,
+                            ..
+                        } = upstream
+                        {
+                            *rh = Some(host_val);
+                        }
+                    }
+                    "sni" => {
+                        let sni_val = cursor.expect_word("TLS SNI server name")?.kind_word();
+                        if let UpstreamTarget::Https { ref mut sni, .. } = upstream {
+                            *sni = sni_val;
+                        } else {
                             return Err(FluxgateError::ConfigSyntax {
-                                file: proto_tok.file,
-                                line: proto_tok.line,
-                                msg: format!(
-                                    "Unsupported transport protocol '{}' (expected 'http')",
-                                    proto
-                                ),
+                                file: sub_tok.file,
+                                line: sub_tok.line,
+                                msg: "'sni' is only valid for https:// upstreams".to_string(),
                             });
                         }
-                        cursor.expect(TokenKind::OpenBrace, "open brace '{' for transport")?;
-                        while let Some(tk) = cursor.peek_kind() {
-                            if *tk == TokenKind::CloseBrace {
-                                cursor.next();
-                                break;
-                            }
-                            if *tk == TokenKind::Newline {
-                                cursor.next();
-                                continue;
-                            }
-                            let t_tok = cursor.next().unwrap();
-                            match t_tok.kind_word().as_str() {
-                                "versions" => {
-                                    while let Some(vk) = cursor.peek_kind() {
-                                        if *vk == TokenKind::Newline || *vk == TokenKind::CloseBrace
-                                        {
-                                            break;
-                                        }
-                                        if let TokenKind::Word(ver) = vk {
-                                            if ver == "h2c" {
-                                                transport.h2c = true;
-                                            }
-                                            transport.versions.push(ver.clone());
-                                            cursor.next();
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                }
-                                "h2_stream_window_size" => {
-                                    let val_tok =
-                                        cursor.expect_word("h2_stream_window_size value")?;
-                                    transport.h2_stream_window_size =
-                                        parse_byte_size_u32(&val_tok)?;
-                                }
-                                "h2_connection_window_size" => {
-                                    let val_tok =
-                                        cursor.expect_word("h2_connection_window_size value")?;
-                                    transport.h2_connection_window_size =
-                                        parse_byte_size_u32(&val_tok)?;
-                                }
-                                "h2_ping_interval" | "h2_ping_interval_secs" => {
-                                    let val_tok = cursor.expect_word("h2_ping_interval value")?;
-                                    transport.h2_ping_interval_secs =
-                                        parse_duration_secs(&val_tok)?;
-                                }
-                                "max_h2_streams" => {
-                                    let val_tok = cursor.expect_word("max_h2_streams value")?;
-                                    let raw = val_tok.kind_word();
-                                    transport.max_h2_streams =
-                                        raw.parse::<usize>().map_err(|_| {
-                                            FluxgateError::ConfigSyntax {
-                                                file: val_tok.file,
-                                                line: val_tok.line,
-                                                msg: format!(
-                                                "Invalid max_h2_streams '{}' (expected integer)",
-                                                raw
-                                            ),
-                                            }
-                                        })?;
-                                }
-                                "read_timeout" | "read_timeout_secs" => {
-                                    let val_tok = cursor.expect_word("read_timeout value")?;
-                                    transport.read_timeout_secs = parse_duration_secs(&val_tok)?;
-                                }
-                                "idle_timeout" | "idle_timeout_secs" => {
-                                    let val_tok = cursor.expect_word("idle_timeout value")?;
-                                    transport.idle_timeout_secs = parse_duration_secs(&val_tok)?;
-                                }
-                                other => {
-                                    return Err(FluxgateError::ConfigSyntax {
-                                        file: t_tok.file,
-                                        line: t_tok.line,
-                                        msg: format!(
-                                            "Unrecognized transport http sub-directive '{}'",
-                                            other
-                                        ),
-                                    });
-                                }
-                            }
-                        }
+                    }
+                    "transport" => {
+                        self.parse_transport_http_block(cursor, &mut transport)?;
                     }
                     other => {
                         return Err(FluxgateError::ConfigSyntax {
@@ -652,6 +620,371 @@ impl Parser {
             upstream,
             flush_interval,
             transport,
+            rewrite_host,
+        })
+    }
+
+    fn parse_transport_http_block(
+        &self,
+        cursor: &mut TokenCursor,
+        transport: &mut TransportConfig,
+    ) -> Result<()> {
+        let proto_tok = cursor.expect_word("transport protocol (e.g. http)")?;
+        let proto = proto_tok.kind_word();
+        if proto != "http" {
+            return Err(FluxgateError::ConfigSyntax {
+                file: proto_tok.file,
+                line: proto_tok.line,
+                msg: format!(
+                    "Unsupported transport protocol '{}' (expected 'http')",
+                    proto
+                ),
+            });
+        }
+        cursor.expect(TokenKind::OpenBrace, "open brace '{' for transport")?;
+        while let Some(tk) = cursor.peek_kind() {
+            if *tk == TokenKind::CloseBrace {
+                cursor.next();
+                break;
+            }
+            if *tk == TokenKind::Newline {
+                cursor.next();
+                continue;
+            }
+            let t_tok = cursor.next().unwrap();
+            match t_tok.kind_word().as_str() {
+                "versions" => {
+                    while let Some(vk) = cursor.peek_kind() {
+                        if *vk == TokenKind::Newline || *vk == TokenKind::CloseBrace {
+                            break;
+                        }
+                        if let TokenKind::Word(ver) = vk {
+                            if ver == "h2c" {
+                                transport.h2c = true;
+                            }
+                            transport.versions.push(ver.clone());
+                            cursor.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                "h2_stream_window_size" => {
+                    let val_tok = cursor.expect_word("h2_stream_window_size value")?;
+                    transport.h2_stream_window_size = parse_byte_size_u32(&val_tok)?;
+                }
+                "h2_connection_window_size" => {
+                    let val_tok = cursor.expect_word("h2_connection_window_size value")?;
+                    transport.h2_connection_window_size = parse_byte_size_u32(&val_tok)?;
+                }
+                "h2_ping_interval" | "h2_ping_interval_secs" => {
+                    let val_tok = cursor.expect_word("h2_ping_interval value")?;
+                    transport.h2_ping_interval_secs = parse_duration_secs(&val_tok)?;
+                }
+                "max_h2_streams" => {
+                    let val_tok = cursor.expect_word("max_h2_streams value")?;
+                    let raw = val_tok.kind_word();
+                    transport.max_h2_streams = raw.parse::<usize>().map_err(|_| {
+                        FluxgateError::ConfigSyntax {
+                            file: val_tok.file,
+                            line: val_tok.line,
+                            msg: format!("Invalid max_h2_streams '{}' (expected integer)", raw),
+                        }
+                    })?;
+                }
+                "read_timeout" | "read_timeout_secs" => {
+                    let val_tok = cursor.expect_word("read_timeout value")?;
+                    transport.read_timeout_secs = parse_duration_secs(&val_tok)?;
+                }
+                "idle_timeout" | "idle_timeout_secs" => {
+                    let val_tok = cursor.expect_word("idle_timeout value")?;
+                    transport.idle_timeout_secs = parse_duration_secs(&val_tok)?;
+                }
+                other => {
+                    return Err(FluxgateError::ConfigSyntax {
+                        file: t_tok.file,
+                        line: t_tok.line,
+                        msg: format!("Unrecognized transport http sub-directive '{}'", other),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_hybrid_proxy(&self, cursor: &mut TokenCursor, open_tok: Token) -> Result<HybridProxyConfig> {
+        cursor.expect(TokenKind::OpenBrace, "open brace '{' for hybrid_proxy")?;
+        let mut mode = HybridMode::WeightedFailover;
+        let mut sticky_key = None;
+        let mut retry_safe_methods = Vec::new();
+        let mut upstreams = Vec::new();
+
+        while let Some(kind) = cursor.peek_kind() {
+            if *kind == TokenKind::CloseBrace {
+                cursor.next();
+                return Ok(HybridProxyConfig {
+                    mode,
+                    sticky_key,
+                    retry_safe_methods,
+                    upstreams,
+                });
+            }
+            if *kind == TokenKind::Newline {
+                cursor.next();
+                continue;
+            }
+
+            let sub_tok = cursor.next().unwrap();
+            let sub_word = sub_tok.kind_word();
+            match sub_word.as_str() {
+                "mode" => {
+                    let mode_tok = cursor.expect_word("hybrid_proxy mode (weighted_failover)")?;
+                    match mode_tok.kind_word().as_str() {
+                        "weighted_failover" => mode = HybridMode::WeightedFailover,
+                        other => {
+                            return Err(FluxgateError::ConfigSyntax {
+                                file: mode_tok.file,
+                                line: mode_tok.line,
+                                msg: format!(
+                                    "Unsupported hybrid_proxy mode '{}', expected 'weighted_failover'",
+                                    other
+                                ),
+                            });
+                        }
+                    }
+                }
+                "sticky_key" => {
+                    let sk_tok = cursor
+                        .expect_word("sticky_key spec (header(<Name>)|client_ip|path)")?;
+                    sticky_key = Some(parse_sticky_key(&sk_tok)?);
+                }
+                "retry_safe_methods" => {
+                    retry_safe_methods.clear();
+                    while let Some(mk) = cursor.peek_kind() {
+                        if *mk == TokenKind::Newline || *mk == TokenKind::CloseBrace {
+                            break;
+                        }
+                        if let TokenKind::Word(m) = mk {
+                            retry_safe_methods.push(m.to_ascii_uppercase());
+                            cursor.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if retry_safe_methods.is_empty() {
+                        return Err(FluxgateError::ConfigSyntax {
+                            file: sub_tok.file,
+                            line: sub_tok.line,
+                            msg: "retry_safe_methods requires at least one HTTP method".to_string(),
+                        });
+                    }
+                }
+                "upstream" => {
+                    let up = self.parse_hybrid_upstream(cursor)?;
+                    upstreams.push(up);
+                }
+                other => {
+                    return Err(FluxgateError::ConfigSyntax {
+                        file: sub_tok.file,
+                        line: sub_tok.line,
+                        msg: format!("Unrecognized hybrid_proxy sub-directive '{}'", other),
+                    });
+                }
+            }
+        }
+
+        Err(FluxgateError::ConfigSyntax {
+            file: open_tok.file,
+            line: open_tok.line,
+            msg: "Unclosed hybrid_proxy block, expected '}'".to_string(),
+        })
+    }
+
+    fn parse_hybrid_upstream(&self, cursor: &mut TokenCursor) -> Result<HybridUpstreamConfig> {
+        let name = cursor.expect_word("hybrid upstream name")?.kind_word();
+        let target_tok = cursor.expect_word("hybrid upstream address or URL")?;
+        let target_raw = target_tok.kind_word();
+
+        let mut transport = TransportConfig::default();
+        let mut target = parse_upstream_target(&target_raw, &target_tok, &mut transport)?;
+        let mut rewrite_host = match &target {
+            UpstreamTarget::Https { rewrite_host, .. } => rewrite_host.clone(),
+            _ => None,
+        };
+
+        let mut weight: u32 = 100;
+        let mut role = HybridUpstreamRole::Primary;
+        let mut connect_timeout_ms = DEFAULT_CONNECT_TIMEOUT_MS;
+        let mut read_timeout_ms = DEFAULT_READ_TIMEOUT_SECS * 1000;
+        let mut daily_budget = None;
+        let mut fallback_on_status = Vec::new();
+        let mut fallback_on_headers = Vec::new();
+        let mut headers_up = Vec::new();
+        let mut flush_interval = -1;
+
+        if cursor.peek_kind() == Some(&TokenKind::OpenBrace) {
+            cursor.next(); // consume '{'
+            while let Some(k) = cursor.peek_kind() {
+                if *k == TokenKind::CloseBrace {
+                    cursor.next();
+                    break;
+                }
+                if *k == TokenKind::Newline {
+                    cursor.next();
+                    continue;
+                }
+
+                let u_tok = cursor.next().unwrap();
+                match u_tok.kind_word().as_str() {
+                    "weight" => {
+                        let w_tok = cursor.expect_word("upstream weight (non-negative integer)")?;
+                        let w_raw = w_tok.kind_word();
+                        weight = w_raw.parse::<u32>().map_err(|_| FluxgateError::ConfigSyntax {
+                            file: w_tok.file,
+                            line: w_tok.line,
+                            msg: format!(
+                                "Invalid upstream weight '{}' (weights are non-sensitive GitOps integers; do not store weights in Vault KV)",
+                                w_raw
+                            ),
+                        })?;
+                    }
+                    "role" => {
+                        let r_tok = cursor.expect_word("upstream role (primary|fallback)")?;
+                        match r_tok.kind_word().as_str() {
+                            "primary" => role = HybridUpstreamRole::Primary,
+                            "fallback" => role = HybridUpstreamRole::Fallback,
+                            other => {
+                                return Err(FluxgateError::ConfigSyntax {
+                                    file: r_tok.file,
+                                    line: r_tok.line,
+                                    msg: format!(
+                                        "Invalid upstream role '{}', expected 'primary' or 'fallback'",
+                                        other
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    "rewrite_host" => {
+                        let h = cursor.expect_word("rewrite_host hostname")?.kind_word();
+                        rewrite_host = Some(h.clone());
+                        if let UpstreamTarget::Https {
+                            rewrite_host: ref mut rh,
+                            ..
+                        } = target
+                        {
+                            *rh = Some(h);
+                        }
+                    }
+                    "sni" => {
+                        let sni_val = cursor.expect_word("TLS SNI hostname")?.kind_word();
+                        if let UpstreamTarget::Https { ref mut sni, .. } = target {
+                            *sni = sni_val;
+                        } else {
+                            return Err(FluxgateError::ConfigSyntax {
+                                file: u_tok.file,
+                                line: u_tok.line,
+                                msg: "'sni' is only valid for https:// upstreams".to_string(),
+                            });
+                        }
+                    }
+                    "connect_timeout" => {
+                        let d_tok = cursor.expect_word("connect_timeout (e.g. 800ms, 2s)")?;
+                        connect_timeout_ms = parse_duration_millis(&d_tok)?;
+                    }
+                    "read_timeout" | "timeout" => {
+                        let d_tok = cursor.expect_word("read_timeout (e.g. 2000ms, 15s)")?;
+                        read_timeout_ms = parse_duration_millis(&d_tok)?;
+                    }
+                    "daily_budget" => {
+                        let b_tok = cursor.expect_word("daily_budget request count")?;
+                        let raw = b_tok.kind_word();
+                        let val = raw.parse::<u64>().map_err(|_| FluxgateError::ConfigSyntax {
+                            file: b_tok.file,
+                            line: b_tok.line,
+                            msg: format!("Invalid daily_budget '{}'", raw),
+                        })?;
+                        daily_budget = Some(val);
+                    }
+                    "fallback_on_status" => {
+                        while let Some(sk) = cursor.peek_kind() {
+                            if *sk == TokenKind::Newline || *sk == TokenKind::CloseBrace {
+                                break;
+                            }
+                            if let TokenKind::Word(code_str) = sk {
+                                let code = code_str.parse::<u16>().map_err(|_| {
+                                    let bad = cursor.current().unwrap();
+                                    FluxgateError::ConfigSyntax {
+                                        file: bad.file.clone(),
+                                        line: bad.line,
+                                        msg: format!(
+                                            "Invalid HTTP status code '{}' in fallback_on_status",
+                                            code_str
+                                        ),
+                                    }
+                                })?;
+                                fallback_on_status.push(code);
+                                cursor.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    "fallback_on_header" => {
+                        let h_tok = cursor.expect_word("fallback_on_header (Header=Value)")?;
+                        let raw = h_tok.kind_word();
+                        let Some((hk, hv)) = raw.split_once('=') else {
+                            return Err(FluxgateError::ConfigSyntax {
+                                file: h_tok.file,
+                                line: h_tok.line,
+                                msg: format!(
+                                    "Expected Header=Value in fallback_on_header, got '{}'",
+                                    raw
+                                ),
+                            });
+                        };
+                        fallback_on_headers
+                            .push((hk.trim().to_string(), hv.trim().to_string()));
+                    }
+                    "header_up" => {
+                        let h_name = cursor.expect_word("header_up header name")?.kind_word();
+                        let h_val = cursor
+                            .expect_word("header_up value or {vault.*}")?
+                            .kind_word();
+                        headers_up.push((h_name, parse_secret_ref(&h_val)));
+                    }
+                    "flush_interval" => {
+                        let val = cursor.expect_word("flush_interval value")?.kind_word();
+                        flush_interval = val.parse::<i32>().unwrap_or(-1);
+                    }
+                    "transport" => {
+                        self.parse_transport_http_block(cursor, &mut transport)?;
+                    }
+                    other => {
+                        return Err(FluxgateError::ConfigSyntax {
+                            file: u_tok.file,
+                            line: u_tok.line,
+                            msg: format!("Unrecognized hybrid upstream directive '{}'", other),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(HybridUpstreamConfig {
+            name,
+            target,
+            weight,
+            role,
+            connect_timeout_ms,
+            read_timeout_ms,
+            daily_budget,
+            fallback_on_status,
+            fallback_on_headers,
+            headers_up,
+            flush_interval,
+            transport,
+            rewrite_host,
         })
     }
 
@@ -999,6 +1332,126 @@ fn parse_byte_size_u32(tok: &Token) -> Result<u32> {
             "Invalid byte size '{}' (expected e.g. 4194304, 4MiB, 16m)",
             raw
         ),
+    })
+}
+
+fn parse_upstream_target(
+    upstream_str: &str,
+    tok: &Token,
+    transport: &mut TransportConfig,
+) -> Result<UpstreamTarget> {
+    if let Some(rest) = upstream_str.strip_prefix("unix+h2c/") {
+        let abs = format!("/{}", rest.trim_start_matches('/'));
+        transport.h2c = true;
+        transport.versions = vec!["h2c".to_string(), "2".to_string()];
+        return Ok(UpstreamTarget::Uds(PathBuf::from(abs)));
+    }
+    if let Some(rest) = upstream_str.strip_prefix("unix/") {
+        let abs = format!("/{}", rest.trim_start_matches('/'));
+        return Ok(UpstreamTarget::Uds(PathBuf::from(abs)));
+    }
+    if let Some(rest) = upstream_str.strip_prefix("unix:") {
+        return Ok(UpstreamTarget::Uds(PathBuf::from(rest)));
+    }
+    if upstream_str.starts_with("https://") || upstream_str.starts_with("http://") {
+        let parsed = url::Url::parse(upstream_str).map_err(|e| FluxgateError::ConfigSyntax {
+            file: tok.file.clone(),
+            line: tok.line,
+            msg: format!("Invalid upstream URL '{}': {}", upstream_str, e),
+        })?;
+        let host = parsed.host_str().ok_or_else(|| FluxgateError::ConfigSyntax {
+            file: tok.file.clone(),
+            line: tok.line,
+            msg: format!("Upstream URL '{}' missing host", upstream_str),
+        })?;
+        if parsed.path() != "/" && !parsed.path().is_empty() {
+            return Err(FluxgateError::ConfigSyntax {
+                file: tok.file.clone(),
+                line: tok.line,
+                msg: format!(
+                    "Upstream URL '{}' must not include a path ('{}'); use rewrite instead",
+                    upstream_str,
+                    parsed.path()
+                ),
+            });
+        }
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        let addr = if host.starts_with('[') {
+            format!("{}:{}", host, port)
+        } else if host.contains(':') {
+            format!("[{}]:{}", host, port)
+        } else {
+            format!("{}:{}", host, port)
+        };
+        return if parsed.scheme() == "https" {
+            let clean_host = host.trim_matches(|c| c == '[' || c == ']').to_string();
+            Ok(UpstreamTarget::Https {
+                addr,
+                sni: clean_host.clone(),
+                rewrite_host: Some(clean_host),
+            })
+        } else {
+            Ok(UpstreamTarget::Tcp(addr))
+        };
+    }
+
+    Ok(UpstreamTarget::Tcp(upstream_str.to_string()))
+}
+
+fn parse_sticky_key(tok: &Token) -> Result<StickyKeySpec> {
+    let raw = tok.kind_word();
+    if raw == "client_ip" {
+        return Ok(StickyKeySpec::ClientIp);
+    }
+    if raw == "path" {
+        return Ok(StickyKeySpec::Path);
+    }
+    if let Some(inner) = raw
+        .strip_prefix("header(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let h = inner.trim();
+        if h.is_empty() {
+            return Err(FluxgateError::ConfigSyntax {
+                file: tok.file.clone(),
+                line: tok.line,
+                msg: "header(...) sticky_key requires a non-empty header name".to_string(),
+            });
+        }
+        return Ok(StickyKeySpec::Header(h.to_string()));
+    }
+    Err(FluxgateError::ConfigSyntax {
+        file: tok.file.clone(),
+        line: tok.line,
+        msg: format!(
+            "Invalid sticky_key '{}': expected header(<Name>), client_ip, or path",
+            raw
+        ),
+    })
+}
+
+fn parse_duration_millis(tok: &Token) -> Result<u64> {
+    let raw = tok.kind_word();
+    let (num_str, mult) = if let Some(n) = raw.strip_suffix("ms") {
+        (n, 1u64)
+    } else if let Some(n) = raw.strip_suffix('s') {
+        (n, 1000u64)
+    } else if let Some(n) = raw.strip_suffix('m') {
+        (n, 60_000u64)
+    } else if let Some(n) = raw.strip_suffix('h') {
+        (n, 3_600_000u64)
+    } else {
+        (raw.as_str(), 1000u64)
+    };
+
+    let val = num_str
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult));
+    val.ok_or_else(|| FluxgateError::ConfigSyntax {
+        file: tok.file.clone(),
+        line: tok.line,
+        msg: format!("Invalid duration '{}' (expected e.g. 800ms, 2s, 1m)", raw),
     })
 }
 

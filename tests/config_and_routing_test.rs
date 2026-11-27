@@ -175,6 +175,7 @@ jp-xconnect-01.svc.plus jp-xconnect-02.svc.plus jp-xconnect.svc.plus tky-proxy.s
                 flush_immediately,
                 transport,
                 new_uri,
+                ..
             } => {
                 assert_eq!(
                     upstream,

@@ -1,8 +1,10 @@
 use crate::config::ast::*;
+use crate::hybrid::CompiledHybridPool;
 use crate::proxy::rewrite::{rebuild_uri, remove_query_param, strip_path_prefix};
 use http::Uri;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct CompiledRouter {
@@ -42,6 +44,7 @@ pub enum RouteBlockKind {
 #[derive(Debug, Clone)]
 pub enum RouteAction {
     ReverseProxy(ReverseProxyConfig),
+    HybridProxy(Arc<CompiledHybridPool>),
     Respond(RespondConfig),
 }
 
@@ -51,6 +54,11 @@ pub enum RouteResolution {
         upstream: UpstreamTarget,
         flush_immediately: bool,
         transport: crate::config::TransportConfig,
+        rewrite_host: Option<String>,
+        new_uri: Option<Uri>,
+    },
+    HybridProxy {
+        pool: Arc<CompiledHybridPool>,
         new_uri: Option<Uri>,
     },
     Respond {
@@ -154,6 +162,16 @@ impl CompiledSite {
                         action: RouteAction::ReverseProxy(rp.clone()),
                     });
                 }
+                Directive::HybridProxy(hp) => {
+                    routes.push(CompiledRouteBlock {
+                        kind: RouteBlockKind::Handle {
+                            matcher_paths: None,
+                        },
+                        query_removals: Vec::new(),
+                        inner_rewrites: Vec::new(),
+                        action: RouteAction::HybridProxy(Arc::new(CompiledHybridPool::compile(hp))),
+                    });
+                }
                 Directive::Respond(resp) => {
                     fallback = Some(resp.clone());
                 }
@@ -240,6 +258,18 @@ impl CompiledSite {
                         upstream: rp.upstream.clone(),
                         flush_immediately: rp.flush_interval < 0,
                         transport: rp.transport.clone(),
+                        rewrite_host: rp.rewrite_host.clone(),
+                        new_uri,
+                    };
+                }
+                RouteAction::HybridProxy(pool) => {
+                    let new_uri = if uri_mutated {
+                        rebuild_uri(original_uri, &current_path, current_query.as_deref())
+                    } else {
+                        None
+                    };
+                    return RouteResolution::HybridProxy {
+                        pool: pool.clone(),
                         new_uri,
                     };
                 }
@@ -274,6 +304,11 @@ fn compile_block(kind: RouteBlockKind, directives: &[Directive]) -> Option<Compi
             Directive::UriQueryRemove { param } => query_removals.push(param.clone()),
             Directive::Rewrite { target, .. } => inner_rewrites.push(target.clone()),
             Directive::ReverseProxy(rp) => action = Some(RouteAction::ReverseProxy(rp.clone())),
+            Directive::HybridProxy(hp) => {
+                action = Some(RouteAction::HybridProxy(Arc::new(
+                    CompiledHybridPool::compile(hp),
+                )));
+            }
             Directive::Respond(resp) => action = Some(RouteAction::Respond(resp.clone())),
             _ => {}
         }
@@ -408,6 +443,7 @@ jp-xconnect-01.svc.plus jp-xconnect-02.svc.plus {
                 flush_immediately,
                 transport,
                 new_uri,
+                ..
             } => {
                 assert_eq!(
                     upstream,

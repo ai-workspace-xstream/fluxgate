@@ -122,9 +122,68 @@ fn resolve_node_id() -> String {
 
 struct ConfigReloadService {
     config_path: PathBuf,
+    initial_hash: String,
     router: Arc<ArcSwap<CompiledRouter>>,
     cert_store: Arc<DynamicCertStore>,
     metrics: Option<Arc<MetricsRegistry>>,
+}
+
+impl ConfigReloadService {
+    fn apply_reload(&self, trigger: &str, last_hash: &mut String) {
+        let ts = now_unix_secs();
+        match load_config(&self.config_path) {
+            Ok(new_cfg) => {
+                let hash = compute_config_hash(&new_cfg);
+                if trigger == "file_watch" && hash == *last_hash {
+                    return;
+                }
+                if let Err(e) = sync_static_certs_to_store(
+                    &new_cfg,
+                    &self.cert_store,
+                    self.metrics.as_deref(),
+                ) {
+                    tracing::error!(
+                        "Hot-reload ({}) aborted (TLS load failure), keeping active config: {}",
+                        trigger,
+                        e
+                    );
+                    if let Some(m) = &self.metrics {
+                        m.record_config_reload(false, "", ts);
+                    }
+                    return;
+                }
+
+                let new_router = CompiledRouter::compile(&new_cfg);
+                self.router.store(Arc::new(new_router));
+                *last_hash = hash.clone();
+                if let Some(m) = &self.metrics {
+                    m.record_config_reload(true, &hash, ts);
+                }
+                tracing::info!(
+                    "Hot-reload ({}) applied: {} site block(s), sha256={}",
+                    trigger,
+                    new_cfg.sites.len(),
+                    &hash[..12.min(hash.len())]
+                );
+            }
+            Err(e) => {
+                if trigger == "sighup" {
+                    tracing::error!(
+                        "Hot-reload rejected invalid config, keeping active config: {}",
+                        e
+                    );
+                    if let Some(m) = &self.metrics {
+                        m.record_config_reload(false, "", ts);
+                    }
+                } else {
+                    tracing::warn!(
+                        "GitOps ConfigMap watch ignored invalid candidate config: {}",
+                        e
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -138,11 +197,16 @@ impl BackgroundService for ConfigReloadService {
                 return;
             }
         };
+        let mut watch_tick = tokio::time::interval(Duration::from_secs(5));
+        watch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume immediate initial tick
+        watch_tick.tick().await;
+        let mut last_hash = self.initial_hash.clone();
 
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
-                    tracing::info!("Shutting down SIGHUP reload watcher");
+                    tracing::info!("Shutting down config reload watcher");
                     break;
                 }
                 sig = sighup.recv() => {
@@ -153,46 +217,10 @@ impl BackgroundService for ConfigReloadService {
                         "Received SIGHUP, reloading configuration from {}",
                         self.config_path.display()
                     );
-                    let ts = now_unix_secs();
-                    match load_config(&self.config_path) {
-                        Ok(new_cfg) => {
-                            let hash = compute_config_hash(&new_cfg);
-                            if let Err(e) = sync_static_certs_to_store(
-                                &new_cfg,
-                                &self.cert_store,
-                                self.metrics.as_deref(),
-                            ) {
-                                tracing::error!(
-                                    "Hot-reload aborted (TLS load failure), keeping active config: {}",
-                                    e
-                                );
-                                if let Some(m) = &self.metrics {
-                                    m.record_config_reload(false, "", ts);
-                                }
-                                continue;
-                            }
-
-                            let new_router = CompiledRouter::compile(&new_cfg);
-                            self.router.store(Arc::new(new_router));
-                            if let Some(m) = &self.metrics {
-                                m.record_config_reload(true, &hash, ts);
-                            }
-                            tracing::info!(
-                                "Hot-reload applied: {} site block(s), sha256={}",
-                                new_cfg.sites.len(),
-                                &hash[..12.min(hash.len())]
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Hot-reload rejected invalid config, keeping active config: {}",
-                                e
-                            );
-                            if let Some(m) = &self.metrics {
-                                m.record_config_reload(false, "", ts);
-                            }
-                        }
-                    }
+                    self.apply_reload("sighup", &mut last_hash);
+                }
+                _ = watch_tick.tick() => {
+                    self.apply_reload("file_watch", &mut last_hash);
                 }
             }
         }
@@ -538,9 +566,10 @@ fn main() {
             }
 
             let reload_svc = background_service(
-                "Fluxgate SIGHUP Reloader",
+                "Fluxgate SIGHUP & GitOps Reloader",
                 ConfigReloadService {
                     config_path: config.clone(),
+                    initial_hash,
                     router: router.clone(),
                     cert_store: cert_store.clone(),
                     metrics: metrics_registry.clone(),
@@ -548,7 +577,8 @@ fn main() {
             );
             server.add_service(reload_svc);
 
-            let proxy = FluxgateProxy::new(router, https_enabled, metrics_registry);
+            let proxy = FluxgateProxy::new(router, https_enabled, metrics_registry)
+                .with_secret_store(secret_store);
             let mut service =
                 http_proxy_service_with_name(&server.configuration, proxy, "Fluxgate HTTP Proxy");
 

@@ -203,7 +203,7 @@ fn validate_site(
 
     // Validate directives
     for directive in &site.directives {
-        validate_directive(directive, &matcher_names, strict_gitops)?;
+        validate_directive(directive, &matcher_names, vault_aliases, strict_gitops)?;
     }
 
     Ok(())
@@ -318,6 +318,7 @@ fn validate_tls(tls: &TlsConfig, vault_aliases: &HashSet<&str>, strict_gitops: b
 fn validate_directive(
     directive: &Directive,
     matchers: &HashSet<&str>,
+    vault_aliases: &HashSet<&str>,
     strict_gitops: bool,
 ) -> Result<()> {
     match directive {
@@ -329,7 +330,7 @@ fn validate_directive(
                 )));
             }
             for inner in directives {
-                validate_directive(inner, matchers, strict_gitops)?;
+                validate_directive(inner, matchers, vault_aliases, strict_gitops)?;
             }
         }
         Directive::Handle {
@@ -345,7 +346,7 @@ fn validate_directive(
                 }
             }
             for inner in directives {
-                validate_directive(inner, matchers, strict_gitops)?;
+                validate_directive(inner, matchers, vault_aliases, strict_gitops)?;
             }
         }
         Directive::Rewrite { matcher, target } => {
@@ -372,60 +373,14 @@ fn validate_directive(
             }
         }
         Directive::ReverseProxy(rp) => {
-            match &rp.upstream {
-                UpstreamTarget::Uds(p) => {
-                    if p.as_os_str().is_empty() {
-                        return Err(FluxgateError::ConfigValidation(
-                            "Unix socket upstream path cannot be empty".to_string(),
-                        ));
-                    }
-                }
-                UpstreamTarget::Tcp(addr) => {
-                    if addr.is_empty() {
-                        return Err(FluxgateError::ConfigValidation(
-                            "TCP upstream address cannot be empty".to_string(),
-                        ));
-                    }
-                }
+            validate_upstream_target(&rp.upstream, strict_gitops)?;
+            if let Some(rh) = &rp.rewrite_host {
+                validate_rewrite_host(rh, strict_gitops)?;
             }
-
-            const MAX_H2_WINDOW_SIZE: u32 = (1u32 << 31) - 1;
-            if rp.transport.h2_stream_window_size == 0
-                || rp.transport.h2_stream_window_size > MAX_H2_WINDOW_SIZE
-            {
-                return Err(FluxgateError::ConfigValidation(format!(
-                    "h2_stream_window_size must be between 1 and {} bytes",
-                    MAX_H2_WINDOW_SIZE
-                )));
-            }
-            if rp.transport.h2_connection_window_size == 0
-                || rp.transport.h2_connection_window_size > MAX_H2_WINDOW_SIZE
-            {
-                return Err(FluxgateError::ConfigValidation(format!(
-                    "h2_connection_window_size must be between 1 and {} bytes",
-                    MAX_H2_WINDOW_SIZE
-                )));
-            }
-            if rp.transport.max_h2_streams == 0 {
-                return Err(FluxgateError::ConfigValidation(
-                    "max_h2_streams must be at least 1".to_string(),
-                ));
-            }
-            if rp.transport.h2_ping_interval_secs == 0 {
-                return Err(FluxgateError::ConfigValidation(
-                    "h2_ping_interval must be at least 1s".to_string(),
-                ));
-            }
-            if rp.transport.read_timeout_secs == 0 {
-                return Err(FluxgateError::ConfigValidation(
-                    "read_timeout must be at least 1s".to_string(),
-                ));
-            }
-            if rp.transport.idle_timeout_secs == 0 {
-                return Err(FluxgateError::ConfigValidation(
-                    "idle_timeout must be at least 1s".to_string(),
-                ));
-            }
+            validate_transport(&rp.transport)?;
+        }
+        Directive::HybridProxy(hp) => {
+            validate_hybrid_proxy(hp, vault_aliases, strict_gitops)?;
         }
         Directive::Respond(resp) => {
             if strict_gitops && has_secret_markers(&resp.body) {
@@ -436,6 +391,216 @@ fn validate_directive(
             }
         }
     }
+    Ok(())
+}
+
+fn validate_upstream_target(target: &UpstreamTarget, strict_gitops: bool) -> Result<()> {
+    match target {
+        UpstreamTarget::Uds(p) => {
+            if p.as_os_str().is_empty() {
+                return Err(FluxgateError::ConfigValidation(
+                    "Unix socket upstream path cannot be empty".to_string(),
+                ));
+            }
+        }
+        UpstreamTarget::Tcp(addr) => {
+            if addr.trim().is_empty() {
+                return Err(FluxgateError::ConfigValidation(
+                    "TCP upstream address cannot be empty".to_string(),
+                ));
+            }
+        }
+        UpstreamTarget::Https {
+            addr,
+            sni,
+            rewrite_host,
+        } => {
+            if addr.trim().is_empty() {
+                return Err(FluxgateError::ConfigValidation(
+                    "HTTPS upstream address cannot be empty".to_string(),
+                ));
+            }
+            if sni.trim().is_empty() || sni.chars().any(char::is_whitespace) {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "Invalid HTTPS upstream SNI '{}'",
+                    sni
+                )));
+            }
+            if let Some(rh) = rewrite_host {
+                validate_rewrite_host(rh, strict_gitops)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_rewrite_host(host: &str, strict_gitops: bool) -> Result<()> {
+    if host.trim().is_empty() || host.chars().any(char::is_whitespace) {
+        return Err(FluxgateError::ConfigValidation(format!(
+            "Invalid rewrite_host '{}'",
+            host
+        )));
+    }
+    if strict_gitops && looks_like_plaintext_secret(host) {
+        return Err(FluxgateError::ConfigValidation(
+            "--strict-gitops rejected suspected secret literal in rewrite_host".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_transport(transport: &TransportConfig) -> Result<()> {
+    const MAX_H2_WINDOW_SIZE: u32 = (1u32 << 31) - 1;
+    if transport.h2_stream_window_size == 0 || transport.h2_stream_window_size > MAX_H2_WINDOW_SIZE
+    {
+        return Err(FluxgateError::ConfigValidation(format!(
+            "h2_stream_window_size must be between 1 and {} bytes",
+            MAX_H2_WINDOW_SIZE
+        )));
+    }
+    if transport.h2_connection_window_size == 0
+        || transport.h2_connection_window_size > MAX_H2_WINDOW_SIZE
+    {
+        return Err(FluxgateError::ConfigValidation(format!(
+            "h2_connection_window_size must be between 1 and {} bytes",
+            MAX_H2_WINDOW_SIZE
+        )));
+    }
+    if transport.max_h2_streams == 0 {
+        return Err(FluxgateError::ConfigValidation(
+            "max_h2_streams must be at least 1".to_string(),
+        ));
+    }
+    if transport.h2_ping_interval_secs == 0 {
+        return Err(FluxgateError::ConfigValidation(
+            "h2_ping_interval must be at least 1s".to_string(),
+        ));
+    }
+    if transport.read_timeout_secs == 0 {
+        return Err(FluxgateError::ConfigValidation(
+            "read_timeout must be at least 1s".to_string(),
+        ));
+    }
+    if transport.idle_timeout_secs == 0 {
+        return Err(FluxgateError::ConfigValidation(
+            "idle_timeout must be at least 1s".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_hybrid_proxy(
+    hp: &HybridProxyConfig,
+    vault_aliases: &HashSet<&str>,
+    strict_gitops: bool,
+) -> Result<()> {
+    if hp.upstreams.is_empty() {
+        return Err(FluxgateError::ConfigValidation(
+            "hybrid_proxy requires at least one upstream block".to_string(),
+        ));
+    }
+    if let Some(StickyKeySpec::Header(h)) = &hp.sticky_key {
+        if h.trim().is_empty() || h.chars().any(char::is_whitespace) {
+            return Err(FluxgateError::ConfigValidation(format!(
+                "Invalid sticky_key header name '{}'",
+                h
+            )));
+        }
+    }
+
+    let mut names = HashSet::new();
+    let mut total_weight = 0u64;
+    let mut has_fallback = false;
+
+    for up in &hp.upstreams {
+        if up.name.trim().is_empty() || up.name.chars().any(char::is_whitespace) {
+            return Err(FluxgateError::ConfigValidation(format!(
+                "Invalid hybrid upstream name '{}'",
+                up.name
+            )));
+        }
+        if !names.insert(up.name.as_str()) {
+            return Err(FluxgateError::ConfigValidation(format!(
+                "Duplicate hybrid upstream name '{}'",
+                up.name
+            )));
+        }
+
+        validate_upstream_target(&up.target, strict_gitops)?;
+        if let Some(rh) = &up.rewrite_host {
+            validate_rewrite_host(rh, strict_gitops)?;
+        }
+        validate_transport(&up.transport)?;
+
+        if up.connect_timeout_ms == 0 {
+            return Err(FluxgateError::ConfigValidation(format!(
+                "hybrid upstream '{}' connect_timeout must be >= 1ms",
+                up.name
+            )));
+        }
+        if up.read_timeout_ms == 0 {
+            return Err(FluxgateError::ConfigValidation(format!(
+                "hybrid upstream '{}' read_timeout must be >= 1ms",
+                up.name
+            )));
+        }
+        if let Some(budget) = up.daily_budget {
+            if budget == 0 {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "hybrid upstream '{}' daily_budget must be >= 1 when specified",
+                    up.name
+                )));
+            }
+        }
+        for &code in &up.fallback_on_status {
+            if !(100..=599).contains(&code) {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "hybrid upstream '{}' invalid HTTP status code {} in fallback_on_status",
+                    up.name, code
+                )));
+            }
+        }
+        for (hk, _) in &up.fallback_on_headers {
+            if hk.is_empty() || hk.chars().any(char::is_whitespace) {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "hybrid upstream '{}' invalid header name '{}' in fallback_on_header",
+                    up.name, hk
+                )));
+            }
+        }
+        for (h_name, h_ref) in &up.headers_up {
+            if h_name.trim().is_empty() || h_name.chars().any(char::is_whitespace) {
+                return Err(FluxgateError::ConfigValidation(format!(
+                    "hybrid upstream '{}' invalid header_up name '{}'",
+                    up.name, h_name
+                )));
+            }
+            let is_auth_header = h_name.eq_ignore_ascii_case("authorization")
+                || h_name.to_ascii_lowercase().contains("token")
+                || h_name.to_ascii_lowercase().contains("secret")
+                || h_name.to_ascii_lowercase().contains("key");
+            validate_secret_ref(
+                &format!("hybrid_proxy.upstream.{}.header_up.{}", up.name, h_name),
+                h_ref,
+                is_auth_header,
+                vault_aliases,
+                strict_gitops,
+            )?;
+        }
+
+        total_weight += u64::from(up.weight);
+        if up.role == HybridUpstreamRole::Fallback {
+            has_fallback = true;
+        }
+    }
+
+    if total_weight == 0 && !has_fallback {
+        return Err(FluxgateError::ConfigValidation(
+            "hybrid_proxy must have positive total weight or a 'role fallback' upstream"
+                .to_string(),
+        ));
+    }
+
     Ok(())
 }
 
