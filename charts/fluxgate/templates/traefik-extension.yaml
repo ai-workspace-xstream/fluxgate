@@ -11,10 +11,12 @@ spec:
     service:
       name: {{ include "fluxgate.fullname" . }}
       port: {{ .Values.service.port }}
+      {{- if .Values.traefikExtension.healthCheck.enabled }}
       healthCheck:
         path: {{ .Values.traefikExtension.healthCheck.path | quote }}
         interval: {{ .Values.traefikExtension.healthCheck.interval | quote }}
         timeout: {{ .Values.traefikExtension.healthCheck.timeout | quote }}
+      {{- end }}
     fallback:
       name: {{ .Values.traefikExtension.fallbackService.name | quote }}
       namespace: {{ .Values.traefikExtension.fallbackService.namespace | quote }}
