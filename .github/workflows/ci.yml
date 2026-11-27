@@ -68,6 +68,7 @@ jobs:
 
   helm-and-docker:
     name: Helm Chart & Docker Image
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -90,6 +91,19 @@ jobs:
             --set networkPolicy.enabled=true > /tmp/fluxgate-full.yaml
           grep -q "kind: TraefikService" /tmp/fluxgate-full.yaml
           grep -q "kind: ExternalSecret" /tmp/fluxgate-full.yaml
+
+      - name: Download native Linux release binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fluxgate-linux-*
+          path: /tmp/artifacts
+
+      - name: Stage multi-arch binaries for Docker context
+        run: |
+          mkdir -p dist/linux/amd64 dist/linux/arm64
+          cp /tmp/artifacts/fluxgate-linux-amd64/fluxgate dist/linux/amd64/fluxgate
+          cp /tmp/artifacts/fluxgate-linux-arm64/fluxgate dist/linux/arm64/fluxgate
+          chmod +x dist/linux/amd64/fluxgate dist/linux/arm64/fluxgate
 
       - name: Setup QEMU
         uses: docker/setup-qemu-action@v3
@@ -119,7 +133,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: ${{ github.event_name != 'pull_request' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
