@@ -153,6 +153,7 @@ traefikExtension:
   failoverErrorsStatus:
     - "502-504"
   healthCheck:
+    enabled: false
     path: /healthz
     interval: 5s
     timeout: 1s
